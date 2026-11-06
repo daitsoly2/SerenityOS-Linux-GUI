@@ -1,0 +1,5 @@
+[App]
+Name=Windows 程序管理
+Executable=/bin/WinAppsSettings
+Category=Settings
+Description=安装、卸载并管理 Windows 游戏与程序

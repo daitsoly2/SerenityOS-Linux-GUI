@@ -1,0 +1,1190 @@
+/*
+ * Copyright (c) 2018-2020, Andreas Kling <kling@serenityos.org>
+ * Copyright (c) 2021, Mițca Dumitru <dumitru0mitca@gmail.com>
+ * Copyright (c) 2022, the SerenityOS developers.
+ * Copyright (c) 2022, Leon Albrecht <leon.a@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <AK/BuiltinWrappers.h>
+#include <AK/Concepts.h>
+#include <AK/FloatingPoint.h>
+#if ARCH(X86_64)
+#    include <AK/FPControl.h>
+#endif
+#include <AK/Math.h>
+#include <AK/Platform.h>
+#include <AK/StdLibExtras.h>
+#include <assert.h>
+#include <fenv.h>
+#include <math.h>
+#include <stdint.h>
+
+#if defined(AK_COMPILER_CLANG)
+#    pragma clang diagnostic push
+#    pragma clang diagnostic ignored "-Wdouble-promotion"
+#endif
+
+enum class RoundingMode {
+    ToZero = FE_TOWARDZERO,
+    Up = FE_UPWARD,
+    Down = FE_DOWNWARD,
+    ToEven = FE_TONEAREST,
+};
+
+// This is much branchier than it really needs to be
+template<typename FloatType>
+static FloatType internal_to_integer(FloatType x, RoundingMode rounding_mode)
+{
+    if (!isfinite(x))
+        return x;
+
+    using Extractor = FloatExtractor<decltype(x)>;
+    // Most component types are larger than int.
+    constexpr auto zero = static_cast<Extractor::ComponentType>(0);
+    constexpr auto one = static_cast<Extractor::ComponentType>(1);
+    auto extractor = Extractor::from_float(x);
+
+    auto unbiased_exponent = extractor.exponent - Extractor::exponent_bias;
+
+    bool has_half_fraction = false;
+    bool has_nonhalf_fraction = false;
+    if (unbiased_exponent < 0) {
+        // it was easier to special case [0..1) as it saves us from
+        // handling subnormals, underflows, etc
+        if (unbiased_exponent == -1) {
+            has_half_fraction = true;
+        }
+
+        has_nonhalf_fraction = unbiased_exponent < -1 || extractor.mantissa != 0;
+        extractor.mantissa = 0;
+        extractor.exponent = 0;
+    } else {
+        if (unbiased_exponent >= Extractor::mantissa_bits)
+            return x;
+
+        auto dead_bitcount = Extractor::mantissa_bits - unbiased_exponent;
+        // Avoid shifting by the integer type's size since that's UB.
+        auto dead_mask = dead_bitcount == sizeof(typename Extractor::ComponentType) * 8 ? ~zero : (one << dead_bitcount) - 1;
+#ifdef AK_HAS_FLOAT_80
+        if constexpr (IsSame<FloatType, f80>) {
+            // x86 80-bit extended floating point requires the top mantissa bit to always be 1, or we get a special Intel NaN.
+            VERIFY(extractor.mantissa >> (Extractor::mantissa_bits - 1u));
+            dead_mask >>= 1u;
+        }
+#endif
+        auto dead_bits = extractor.mantissa & dead_mask;
+        extractor.mantissa &= ~dead_mask;
+
+        auto nonhalf_fraction_mask = dead_mask >> 1;
+        has_nonhalf_fraction = (dead_bits & nonhalf_fraction_mask) != 0;
+        has_half_fraction = (dead_bits & ~nonhalf_fraction_mask) != 0;
+    }
+
+    bool should_round = false;
+    switch (rounding_mode) {
+    case RoundingMode::ToEven:
+        should_round = has_half_fraction;
+        break;
+    case RoundingMode::Up:
+        if (!extractor.sign)
+            should_round = has_nonhalf_fraction || has_half_fraction;
+        break;
+    case RoundingMode::Down:
+        if (extractor.sign)
+            should_round = has_nonhalf_fraction || has_half_fraction;
+        break;
+    case RoundingMode::ToZero:
+        break;
+    }
+
+    auto result = extractor.to_float();
+
+    if (should_round) {
+        // We could do this ourselves, but this saves us from manually
+        // handling overflow.
+        if (extractor.sign)
+            result -= static_cast<FloatType>(1.0);
+        else
+            result += static_cast<FloatType>(1.0);
+    }
+
+    return result;
+}
+
+// https://pubs.opengroup.org/onlinepubs/9799919799/functions/nextafter.html
+// This is much branchier than it really needs to be
+template<FloatingPoint F1, FloatingPoint F2>
+static F1 internal_nextafter(F1 x, F2 target)
+{
+    // "If x==y, y (of the type x) shall be returned."
+    if (x == target)
+        return target;
+
+    bool up = target > x;
+
+    if (!isfinite(x))
+        return x;
+    using Extractor = FloatExtractor<decltype(x)>;
+    auto extractor = Extractor::from_float(x);
+    if (x == 0) {
+        if (!extractor.sign) {
+            extractor.mantissa = 1;
+            extractor.sign = !up;
+            return extractor.to_float();
+        }
+        if (up) {
+            extractor.sign = false;
+            extractor.mantissa = 1;
+            return extractor.to_float();
+        }
+        extractor.mantissa = 1;
+        extractor.sign = up != extractor.sign;
+        return extractor.to_float();
+    }
+    if (up != extractor.sign) {
+        extractor.mantissa++;
+        if (!extractor.mantissa) {
+            // no need to normalize the mantissa as we just hit a power
+            // of two.
+            extractor.exponent++;
+            if (extractor.exponent == Extractor::exponent_max) {
+                extractor.exponent = Extractor::exponent_max - 1;
+                extractor.mantissa = Extractor::mantissa_max;
+            }
+        }
+        return extractor.to_float();
+    }
+
+    if (!extractor.mantissa) {
+        if (extractor.exponent) {
+            extractor.exponent--;
+            extractor.mantissa = Extractor::mantissa_max;
+            return extractor.to_float();
+        }
+        return 0;
+    }
+
+    extractor.mantissa--;
+    if (extractor.mantissa != Extractor::mantissa_max)
+        return extractor.to_float();
+    if (extractor.exponent) {
+        extractor.exponent--;
+        // normalize
+        extractor.mantissa <<= 1;
+    } else {
+        if (extractor.sign) {
+            // Negative infinity
+            extractor.mantissa = 0;
+            extractor.exponent = Extractor::exponent_max;
+        }
+    }
+    return extractor.to_float();
+}
+
+template<typename FloatT>
+static int internal_ilogb(FloatT x) NOEXCEPT
+{
+    if (x == 0)
+        return FP_ILOGB0;
+
+    if (isnan(x))
+        return FP_ILOGBNAN;
+
+    if (!isfinite(x))
+        return INT_MAX;
+
+    using Extractor = FloatExtractor<FloatT>;
+
+    auto extractor = Extractor::from_float(x);
+
+    return (int)extractor.exponent - Extractor::exponent_bias;
+}
+
+template<typename FloatT>
+static FloatT internal_modf(FloatT x, FloatT* intpart) NOEXCEPT
+{
+    FloatT integer_part = internal_to_integer(x, RoundingMode::ToZero);
+    *intpart = integer_part;
+    auto fraction = x - integer_part;
+    if (signbit(fraction) != signbit(x))
+        fraction = -fraction;
+    return fraction;
+}
+
+template<typename FloatT>
+static FloatT internal_scalbn(FloatT x, int exponent) NOEXCEPT
+{
+    if (x == 0 || !isfinite(x) || isnan(x) || exponent == 0)
+        return x;
+
+    using Extractor = FloatExtractor<FloatT>;
+    auto extractor = Extractor::from_float(x);
+
+    if (extractor.exponent != 0) {
+        int new_exponent = (int)extractor.exponent + exponent;
+        if (new_exponent >= (int)Extractor::exponent_max) {
+            extractor.mantissa = 0;
+            extractor.exponent = Extractor::exponent_max;
+            return extractor.to_float();
+        }
+        if (new_exponent > 0) {
+            extractor.exponent = new_exponent;
+            return extractor.to_float();
+        }
+
+        // Number became denormal (which means extractor.exponent <= -exponent, in particular exponent < 0).
+        unsigned shift = min((unsigned)(-new_exponent), Extractor::mantissa_bits) + 1;
+        typename Extractor::ComponentType new_mantissa = extractor.mantissa >> shift;
+        if (shift <= Extractor::mantissa_bits)
+            new_mantissa |= 1ull << (Extractor::mantissa_bits - shift);
+
+        extractor.mantissa = new_mantissa;
+        extractor.exponent = 0;
+        return extractor.to_float();
+    }
+
+    // Denormal x.
+    if (exponent < 0) {
+        unsigned shift = min((unsigned)(-exponent), Extractor::mantissa_bits);
+        extractor.mantissa >>= shift;
+        return extractor.to_float();
+    }
+
+    // extractor.mantissa is always != 0 here.
+    // Mantissa is mantissa_bits long, count_leading_zeroes() counts in ComponentType, adjust:
+    auto const always_zero_bits = sizeof(typename FloatExtractor<FloatT>::ComponentType) * 8 - (FloatExtractor<FloatT>::mantissa_bits);
+    unsigned leading_mantissa_zeroes = count_leading_zeroes(extractor.mantissa) - always_zero_bits;
+    if ((unsigned)exponent <= leading_mantissa_zeroes) {
+        extractor.mantissa <<= exponent;
+        return extractor.to_float();
+    }
+
+    // Denormal is shifted far enough to become non-denormal.
+    int new_exponent = exponent - leading_mantissa_zeroes;
+    if (new_exponent >= (int)Extractor::exponent_max) {
+        extractor.mantissa = 0;
+        extractor.exponent = Extractor::exponent_max;
+        return extractor.to_float();
+    }
+
+    extractor.mantissa <<= (leading_mantissa_zeroes + 1);
+    extractor.exponent = new_exponent;
+
+    return extractor.to_float();
+}
+
+// https://pubs.opengroup.org/onlinepubs/9799919799/functions/fdim.html
+template<FloatingPoint T>
+static T internal_fdim(T x, T y)
+{
+    if (isnan(x) || isnan(y))
+        return AK::NaN<T>;
+    return max(x - y, 0);
+}
+
+// https://pubs.opengroup.org/onlinepubs/9799919799/functions/remquo.html
+template<FloatingPoint T>
+static T internal_remquo(T x, T y, int* quo)
+{
+    if (isnan(x) || isnan(y))
+        return AK::NaN<T>;
+
+    // "In the object pointed to by quo, they store a value whose sign is the sign of x/y and
+    // whose magnitude is congruent modulo 2n to the magnitude of the integral quotient of x/y,
+    // where n is an implementation-defined integer greater than or equal to 3.
+    *quo = AK::rint(x / y);
+
+    // "The remquo(), remquof(), and remquol() functions shall compute the same remainder as
+    // the remainder(), remainderf(), and remainderl() functions, respectively."
+    return AK::remainder(x, y);
+}
+
+template<FloatingPoint T>
+static T internal_erf(T x)
+{
+    // If x is NaN, a NaN shall be returned.
+    if (isnan(x))
+        return AK::NaN<T>;
+
+    // If x is ±0, ±0 shall be returned.
+    if (x == 0)
+        return x;
+
+    // If x is ±Inf, ±1 shall be returned.
+    if (isinf(x))
+        return AK::copysign<T>(1., x);
+
+    // algorithm taken from Abramowitz and Stegun (no. 26.2.17)
+    T t = 1 / (1 + 0.47047l * AK::fabs(x));
+    T poly = t * (0.3480242l + t * (-0.958798l + t * 0.7478556l));
+    T answer = 1 - poly * AK::exp(-x * x);
+    if (x < 0)
+        return -answer;
+
+    return answer;
+}
+
+extern "C" {
+
+float nanf(char const* s) NOEXCEPT
+{
+    return __builtin_nanf(s);
+}
+
+double nan(char const* s) NOEXCEPT
+{
+    return __builtin_nan(s);
+}
+
+long double nanl(char const* s) NOEXCEPT
+{
+    return __builtin_nanl(s);
+}
+
+#define MAKE_AK_BACKED1(name)                     \
+    long double name##l(long double arg) NOEXCEPT \
+    {                                             \
+        return AK::name<long double>(arg);        \
+    }                                             \
+    double name(double arg) NOEXCEPT              \
+    {                                             \
+        return AK::name<double>(arg);             \
+    }                                             \
+    float name##f(float arg) NOEXCEPT             \
+    {                                             \
+        return AK::name<float>(arg);              \
+    }
+#define MAKE_AK_BACKED2(name)                                        \
+    long double name##l(long double arg1, long double arg2) NOEXCEPT \
+    {                                                                \
+        return AK::name<long double>(arg1, arg2);                    \
+    }                                                                \
+    double name(double arg1, double arg2) NOEXCEPT                   \
+    {                                                                \
+        return AK::name<double>(arg1, arg2);                         \
+    }                                                                \
+    float name##f(float arg1, float arg2) NOEXCEPT                   \
+    {                                                                \
+        return AK::name<float>(arg1, arg2);                          \
+    }
+
+MAKE_AK_BACKED1(sin);
+MAKE_AK_BACKED1(cos);
+MAKE_AK_BACKED1(tan);
+MAKE_AK_BACKED1(asin);
+MAKE_AK_BACKED1(acos);
+MAKE_AK_BACKED1(atan);
+MAKE_AK_BACKED1(sinh);
+MAKE_AK_BACKED1(cosh);
+MAKE_AK_BACKED1(tanh);
+MAKE_AK_BACKED1(asinh);
+MAKE_AK_BACKED1(acosh);
+MAKE_AK_BACKED1(atanh);
+MAKE_AK_BACKED1(sqrt);
+MAKE_AK_BACKED1(cbrt);
+MAKE_AK_BACKED1(log);
+MAKE_AK_BACKED1(log2);
+MAKE_AK_BACKED1(log10);
+MAKE_AK_BACKED1(exp);
+MAKE_AK_BACKED1(exp2);
+MAKE_AK_BACKED1(fabs);
+MAKE_AK_BACKED1(rint);
+MAKE_AK_BACKED1(tgamma);
+
+MAKE_AK_BACKED2(atan2);
+MAKE_AK_BACKED2(hypot);
+MAKE_AK_BACKED2(fmod);
+MAKE_AK_BACKED2(pow);
+MAKE_AK_BACKED2(remainder);
+
+long double truncl(long double x) NOEXCEPT
+{
+#if ARCH(X86_64)
+    if (fabsl(x) < LONG_LONG_MAX) {
+        // This is 1.6 times faster than the implementation using the "internal_to_integer"
+        // helper (on x86_64)
+        // https://quick-bench.com/q/xBmxuY8am9qibSYVna90Y6PIvqA
+        u64 temp;
+        asm(
+            "fisttpq %[temp]\n"
+            "fildq %[temp]"
+            : "+t"(x)
+            : [temp] "m"(temp));
+        return x;
+    }
+#endif
+
+    return internal_to_integer(x, RoundingMode::ToZero);
+}
+
+double trunc(double x) NOEXCEPT
+{
+#if ARCH(X86_64)
+    if (fabs(x) < LONG_LONG_MAX) {
+        u64 temp;
+        asm(
+            "fisttpq %[temp]\n"
+            "fildq %[temp]"
+            : "+t"(x)
+            : [temp] "m"(temp));
+        return x;
+    }
+#elif ARCH(RISCV64)
+    if (fabs(x) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.d %0, %1, rtz"
+            : "=r"(output)
+            : "f"(x));
+        return static_cast<double>(output);
+    }
+#endif
+
+    return internal_to_integer(x, RoundingMode::ToZero);
+}
+
+float truncf(float x) NOEXCEPT
+{
+#if ARCH(X86_64)
+    if (fabsf(x) < LONG_LONG_MAX) {
+        u64 temp;
+        asm(
+            "fisttpq %[temp]\n"
+            "fildq %[temp]"
+            : "+t"(x)
+            : [temp] "m"(temp));
+        return x;
+    }
+#elif ARCH(RISCV64)
+    if (fabsf(x) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.s %0, %1, rtz"
+            : "=r"(output)
+            : "f"(x));
+        return static_cast<float>(output);
+    }
+#endif
+
+    return internal_to_integer(x, RoundingMode::ToZero);
+}
+
+long lrintl(long double value)
+{
+#if ARCH(AARCH64)
+    (void)value;
+    TODO_AARCH64();
+#elif ARCH(RISCV64)
+    (void)value;
+    TODO_RISCV64();
+#elif ARCH(X86_64)
+    long res;
+    asm(
+        "fistpl %0\n"
+        : "+m"(res)
+        : "t"(value)
+        : "st");
+    return res;
+#else
+#    error "Unknown architecture"
+#endif
+}
+long lrint(double value)
+{
+#if ARCH(AARCH64)
+    (void)value;
+    TODO_AARCH64();
+#elif ARCH(RISCV64)
+    i64 output;
+    // FIXME: This saturates at 64-bit integer boundaries; see Table 11.4 (RISC-V Unprivileged ISA V20191213)
+    asm("fcvt.l.d %0, %1, dyn"
+        : "=r"(output)
+        : "f"(value));
+    return output;
+#elif ARCH(X86_64)
+    long res;
+    asm(
+        "fistpl %0\n"
+        : "+m"(res)
+        : "t"(value)
+        : "st");
+    return res;
+#else
+#    error "Unknown architecture"
+#endif
+}
+long lrintf(float value)
+{
+#if ARCH(AARCH64)
+    (void)value;
+    TODO_AARCH64();
+#elif ARCH(RISCV64)
+    i64 output;
+    // FIXME: This saturates at 64-bit integer boundaries; see Table 11.4 (RISC-V Unprivileged ISA V20191213)
+    asm("fcvt.l.s %0, %1, dyn"
+        : "=r"(output)
+        : "f"(value));
+    return output;
+#elif ARCH(X86_64)
+    long res;
+    asm(
+        "fistpl %0\n"
+        : "+m"(res)
+        : "t"(value)
+        : "st");
+    return res;
+#else
+#    error "Unknown architecture"
+#endif
+}
+
+long long llrintl(long double value)
+{
+#if ARCH(AARCH64)
+    (void)value;
+    TODO_AARCH64();
+#elif ARCH(RISCV64)
+    // NOTE: RISC-V LP64 specifies long long == long.
+    return static_cast<long long>(lrintl(value));
+#elif ARCH(X86_64)
+    long long res;
+    asm(
+        "fistpq %0\n"
+        : "+m"(res)
+        : "t"(value)
+        : "st");
+    return res;
+#else
+#    error "Unknown architecture"
+#endif
+}
+long long llrint(double value)
+{
+#if ARCH(AARCH64)
+    (void)value;
+    TODO_AARCH64();
+#elif ARCH(RISCV64)
+    // NOTE: RISC-V LP64 specifies long long == long.
+    return static_cast<long long>(lrint(value));
+#elif ARCH(X86_64)
+    long long res;
+    asm(
+        "fistpq %0\n"
+        : "+m"(res)
+        : "t"(value)
+        : "st");
+    return res;
+#else
+#    error "Unknown architecture"
+#endif
+}
+long long llrintf(float value)
+{
+#if ARCH(AARCH64)
+    (void)value;
+    TODO_AARCH64();
+#elif ARCH(RISCV64)
+    // NOTE: RISC-V LP64 specifies long long == long.
+    return static_cast<long long>(lrintf(value));
+#elif ARCH(X86_64)
+    long long res;
+    asm(
+        "fistpq %0\n"
+        : "+m"(res)
+        : "t"(value)
+        : "st");
+    return res;
+#else
+#    error "Unknown architecture"
+#endif
+}
+
+// On systems where FLT_RADIX == 2, ldexp is equivalent to scalbn
+long double ldexpl(long double x, int exp) NOEXCEPT
+{
+    return internal_scalbn(x, exp);
+}
+
+double ldexp(double x, int exp) NOEXCEPT
+{
+    return internal_scalbn(x, exp);
+}
+
+float ldexpf(float x, int exp) NOEXCEPT
+{
+    return internal_scalbn(x, exp);
+}
+
+[[maybe_unused]] static long double ampsin(long double angle) NOEXCEPT
+{
+    long double looped_angle = fmodl(M_PI + angle, M_PI * 2) - M_PI;
+    long double looped_angle_squared = looped_angle * looped_angle;
+
+    long double quadratic_term;
+    if (looped_angle > 0) {
+        quadratic_term = -looped_angle_squared;
+    } else {
+        quadratic_term = looped_angle_squared;
+    }
+
+    long double linear_term = M_PI * looped_angle;
+
+    return quadratic_term + linear_term;
+}
+
+int ilogbl(long double x) NOEXCEPT
+{
+    return internal_ilogb(x);
+}
+
+int ilogb(double x) NOEXCEPT
+{
+    return internal_ilogb(x);
+}
+
+int ilogbf(float x) NOEXCEPT
+{
+    return internal_ilogb(x);
+}
+
+long double logbl(long double x) NOEXCEPT
+{
+    return ilogbl(x);
+}
+
+double logb(double x) NOEXCEPT
+{
+    return ilogb(x);
+}
+
+float logbf(float x) NOEXCEPT
+{
+    return ilogbf(x);
+}
+
+double frexp(double x, int* exp) NOEXCEPT
+{
+    *exp = (x == 0) ? 0 : (1 + ilogb(x));
+    return scalbn(x, -(*exp));
+}
+
+float frexpf(float x, int* exp) NOEXCEPT
+{
+    *exp = (x == 0) ? 0 : (1 + ilogbf(x));
+    return scalbnf(x, -(*exp));
+}
+
+long double frexpl(long double x, int* exp) NOEXCEPT
+{
+    *exp = (x == 0) ? 0 : (1 + ilogbl(x));
+    return scalbnl(x, -(*exp));
+}
+
+double round(double x) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    if (fabs(x) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.d %0, %1, rmm"
+            : "=r"(output)
+            : "f"(x));
+        return static_cast<double>(output);
+    }
+#endif
+
+    return internal_to_integer(x, RoundingMode::ToEven);
+}
+
+float roundf(float x) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    if (fabsf(x) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.s %0, %1, rmm"
+            : "=r"(output)
+            : "f"(x));
+        return static_cast<float>(output);
+    }
+#endif
+
+    return internal_to_integer(x, RoundingMode::ToEven);
+}
+
+long double roundl(long double value) NOEXCEPT
+{
+    return internal_to_integer(value, RoundingMode::ToEven);
+}
+
+long lroundf(float value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    i64 output;
+    asm("fcvt.l.s %0, %1, rmm"
+        : "=r"(output)
+        : "f"(value));
+    return output;
+#endif
+
+    return internal_to_integer(value, RoundingMode::ToEven);
+}
+
+long lround(double value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    i64 output;
+    asm("fcvt.l.d %0, %1, rmm"
+        : "=r"(output)
+        : "f"(value));
+    return output;
+#endif
+
+    return internal_to_integer(value, RoundingMode::ToEven);
+}
+
+long lroundl(long double value) NOEXCEPT
+{
+    return internal_to_integer(value, RoundingMode::ToEven);
+}
+
+long long llroundf(float value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    i64 output;
+    asm("fcvt.l.s %0, %1, rmm"
+        : "=r"(output)
+        : "f"(value));
+    return output;
+#endif
+
+    return internal_to_integer(value, RoundingMode::ToEven);
+}
+
+long long llround(double value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    i64 output;
+    asm("fcvt.l.d %0, %1, rmm"
+        : "=r"(output)
+        : "f"(value));
+    return output;
+#endif
+
+    return internal_to_integer(value, RoundingMode::ToEven);
+}
+
+long long llroundl(long double value) NOEXCEPT
+{
+    return internal_to_integer(value, RoundingMode::ToEven);
+}
+
+float floorf(float value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    if (fabsf(value) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.s %0, %1, rdn"
+            : "=r"(output)
+            : "f"(value));
+        return static_cast<float>(output);
+    }
+#elif ARCH(X86_64)
+    AK::X87RoundingModeScope scope { AK::RoundingMode::DOWN };
+    asm("frndint"
+        : "+t"(value));
+    return value;
+#endif
+    return internal_to_integer(value, RoundingMode::Down);
+}
+
+double floor(double value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    if (fabs(value) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.d %0, %1, rdn"
+            : "=r"(output)
+            : "f"(value));
+        return static_cast<double>(output);
+    }
+#elif ARCH(X86_64)
+    AK::X87RoundingModeScope scope { AK::RoundingMode::DOWN };
+    asm("frndint"
+        : "+t"(value));
+    return value;
+#endif
+    return internal_to_integer(value, RoundingMode::Down);
+}
+
+long double floorl(long double value) NOEXCEPT
+{
+#if ARCH(X86_64)
+    AK::X87RoundingModeScope scope { AK::RoundingMode::DOWN };
+    asm("frndint"
+        : "+t"(value));
+    return value;
+#endif
+    return internal_to_integer(value, RoundingMode::Down);
+}
+
+float ceilf(float value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    if (fabsf(value) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.s %0, %1, rup"
+            : "=r"(output)
+            : "f"(value));
+        return static_cast<float>(output);
+    }
+#elif ARCH(X86_64)
+    AK::X87RoundingModeScope scope { AK::RoundingMode::UP };
+    asm("frndint"
+        : "+t"(value));
+    return value;
+#endif
+    return internal_to_integer(value, RoundingMode::Up);
+}
+
+double ceil(double value) NOEXCEPT
+{
+#if ARCH(RISCV64)
+    if (fabs(value) < LONG_LONG_MAX) {
+        i64 output;
+        asm("fcvt.l.d %0, %1, rup"
+            : "=r"(output)
+            : "f"(value));
+        return static_cast<double>(output);
+    }
+#elif ARCH(X86_64)
+    AK::X87RoundingModeScope scope { AK::RoundingMode::UP };
+    asm("frndint"
+        : "+t"(value));
+    return value;
+#endif
+    return internal_to_integer(value, RoundingMode::Up);
+}
+
+long double ceill(long double value) NOEXCEPT
+{
+#if ARCH(X86_64)
+    AK::X87RoundingModeScope scope { AK::RoundingMode::UP };
+    asm("frndint"
+        : "+t"(value));
+    return value;
+#endif
+    return internal_to_integer(value, RoundingMode::Up);
+}
+
+long double modfl(long double x, long double* intpart) NOEXCEPT
+{
+    return internal_modf(x, intpart);
+}
+
+double modf(double x, double* intpart) NOEXCEPT
+{
+    return internal_modf(x, intpart);
+}
+
+float modff(float x, float* intpart) NOEXCEPT
+{
+    return internal_modf(x, intpart);
+}
+
+double gamma(double x) NOEXCEPT
+{
+    // Stirling approximation
+    return sqrt(2.0 * M_PI / x) * pow(x / M_E, x);
+}
+
+int signgam = 0;
+
+long double lgammal(long double value) NOEXCEPT
+{
+    return lgammal_r(value, &signgam);
+}
+
+double lgamma(double value) NOEXCEPT
+{
+    return lgamma_r(value, &signgam);
+}
+
+float lgammaf(float value) NOEXCEPT
+{
+    return lgammaf_r(value, &signgam);
+}
+
+long double lgammal_r(long double value, int* sign) NOEXCEPT
+{
+    return AK::lgamma_r(value, sign);
+}
+
+double lgamma_r(double value, int* sign) NOEXCEPT
+{
+    return AK::lgamma_r(value, sign);
+}
+
+float lgammaf_r(float value, int* sign) NOEXCEPT
+{
+    return AK::lgamma_r(value, sign);
+}
+
+long double expm1l(long double x) NOEXCEPT
+{
+    return expl(x) - 1;
+}
+
+double expm1(double x) NOEXCEPT
+{
+    return exp(x) - 1;
+}
+
+float expm1f(float x) NOEXCEPT
+{
+    return expf(x) - 1;
+}
+
+long double log1pl(long double x) NOEXCEPT
+{
+    return logl(1 + x);
+}
+
+double log1p(double x) NOEXCEPT
+{
+    return log(1 + x);
+}
+
+float log1pf(float x) NOEXCEPT
+{
+    return logf(1 + x);
+}
+
+long double erfl(long double x) NOEXCEPT
+{
+    return internal_erf(x);
+}
+
+double erf(double x) NOEXCEPT
+{
+    return internal_erf(x);
+}
+
+float erff(float x) NOEXCEPT
+{
+    return internal_erf(x);
+}
+
+long double erfcl(long double x) NOEXCEPT
+{
+    return 1 - erfl(x);
+}
+
+double erfc(double x) NOEXCEPT
+{
+    return 1 - erf(x);
+}
+
+float erfcf(float x) NOEXCEPT
+{
+    return 1 - erff(x);
+}
+
+double nextafter(double x, double target) NOEXCEPT
+{
+    return internal_nextafter(x, target);
+}
+
+float nextafterf(float x, float target) NOEXCEPT
+{
+    return internal_nextafter(x, target);
+}
+
+long double nextafterl(long double x, long double target) NOEXCEPT
+{
+    return internal_nextafter(x, target);
+}
+
+double nexttoward(double x, long double target) NOEXCEPT
+{
+    return internal_nextafter(x, target);
+}
+
+float nexttowardf(float x, long double target) NOEXCEPT
+{
+    return internal_nextafter(x, target);
+}
+
+long double nexttowardl(long double x, long double target) NOEXCEPT
+{
+    return internal_nextafter(x, target);
+}
+
+float copysignf(float x, float y) NOEXCEPT
+{
+    return AK::copysign(x, y);
+}
+
+double copysign(double x, double y) NOEXCEPT
+{
+    return AK::copysign(x, y);
+}
+
+long double copysignl(long double x, long double y) NOEXCEPT
+{
+    return AK::copysign(x, y);
+}
+
+float scalbnf(float x, int exponent) NOEXCEPT
+{
+    return internal_scalbn(x, exponent);
+}
+
+double scalbn(double x, int exponent) NOEXCEPT
+{
+    return internal_scalbn(x, exponent);
+}
+
+long double scalbnl(long double x, int exponent) NOEXCEPT
+{
+    return internal_scalbn(x, exponent);
+}
+
+float scalblnf(float x, long exponent) NOEXCEPT
+{
+    return internal_scalbn(x, exponent);
+}
+
+double scalbln(double x, long exponent) NOEXCEPT
+{
+    return internal_scalbn(x, exponent);
+}
+
+long double scalblnl(long double x, long exponent) NOEXCEPT
+{
+    return internal_scalbn(x, exponent);
+}
+
+long double fmaxl(long double x, long double y) NOEXCEPT
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+
+    return x > y ? x : y;
+}
+
+double fmax(double x, double y) NOEXCEPT
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+
+    return x > y ? x : y;
+}
+
+float fmaxf(float x, float y) NOEXCEPT
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+
+    return x > y ? x : y;
+}
+
+long double fminl(long double x, long double y) NOEXCEPT
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+
+    return x < y ? x : y;
+}
+
+double fmin(double x, double y) NOEXCEPT
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+
+    return x < y ? x : y;
+}
+
+float fminf(float x, float y) NOEXCEPT
+{
+    if (isnan(x))
+        return y;
+    if (isnan(y))
+        return x;
+
+    return x < y ? x : y;
+}
+
+double fdim(double x, double y) NOEXCEPT
+{
+    return internal_fdim(x, y);
+}
+
+float fdimf(float x, float y) NOEXCEPT
+{
+    return internal_fdim(x, y);
+}
+
+long double fdiml(long double x, long double y) NOEXCEPT
+{
+    return internal_fdim(x, y);
+}
+
+// https://pubs.opengroup.org/onlinepubs/9699919799/functions/fma.html
+long double fmal(long double x, long double y, long double z) NOEXCEPT
+{
+    return (x * y) + z;
+}
+
+double fma(double x, double y, double z) NOEXCEPT
+{
+    return (x * y) + z;
+}
+
+float fmaf(float x, float y, float z) NOEXCEPT
+{
+    return (x * y) + z;
+}
+
+double remquo(double x, double y, int* quo) NOEXCEPT
+{
+    return internal_remquo(x, y, quo);
+}
+
+float remquof(float x, float y, int* quo) NOEXCEPT
+{
+    return internal_remquo(x, y, quo);
+}
+
+long double remquol(long double x, long double y, int* quo) NOEXCEPT
+{
+    return internal_remquo(x, y, quo);
+}
+
+long double nearbyintl(long double value) NOEXCEPT
+{
+    return internal_to_integer(value, RoundingMode { fegetround() });
+}
+
+double nearbyint(double value) NOEXCEPT
+{
+    return internal_to_integer(value, RoundingMode { fegetround() });
+}
+
+float nearbyintf(float value) NOEXCEPT
+{
+    return internal_to_integer(value, RoundingMode { fegetround() });
+}
+}
+
+#if defined(AK_COMPILER_CLANG)
+#    pragma clang diagnostic pop
+#endif

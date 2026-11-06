@@ -1,0 +1,63 @@
+#!/bin/sh
+# SerenityOS Linux GUI port: boot the graphics stack and hand over to the login.
+#
+# Quiet by default: the only thing on screen is the boot logo; logs go to
+# /var/log/serenity-session.log. Add "serenity.debug" to the kernel cmdline
+# (or set SERENITY_DEBUG=1) to see the session log on the console.
+set -u
+
+BIN=${SERENITY_BIN:-/home/serenity/serenity/Build/lagom/bin}
+LOG=/var/log/serenity-session.log
+PROGRESS=/run/serenity-progress
+: > "$LOG"
+echo 10 > "$PROGRESS"
+
+DEBUG=0
+[ "${SERENITY_DEBUG:-0}" = "1" ] && DEBUG=1
+grep -q "serenity.debug" /proc/cmdline 2>/dev/null && DEBUG=1
+
+run() {
+    if [ "$DEBUG" = "1" ]; then
+        "$@"
+    else
+        "$@" >>"$LOG" 2>&1
+    fi
+}
+
+echo "--- session start $(date -Is) debug=$DEBUG" >>"$LOG"
+
+export SDL_VIDEODRIVER=kmsdrm
+export SERENITY_RESOURCE_ROOT=/res
+export LD_LIBRARY_PATH=${BIN%/bin}/lib
+
+run "$BIN/serenity-config-server" &
+CONFIG_PID=$!
+run "$BIN/serenity-launch-server" &
+LAUNCH_PID=$!
+echo 30 > "$PROGRESS"
+
+# Retire the framebuffer splash before WindowServer takes the DRM device: if the
+# splash is still holding the fbdev buffer, WindowServer's first page flip is
+# never presented and the console keeps showing the logo.
+echo 100 > "$PROGRESS"
+sleep 0.15
+pkill -x serenity-fb-spl 2>/dev/null || true
+sleep 0.15
+
+run "$BIN/serenity-window-server" --config /etc/WindowServer.ini &
+WS_PID=$!
+
+i=0
+while [ $i -lt 200 ]; do
+    [ -S /tmp/portal/window ] && break
+    i=$((i + 1))
+    sleep 0.05
+done
+
+# Graphical login. With Autologin set in /etc/serenity/session.conf (or
+# --auto-login) it goes straight to the desktop, otherwise it waits for a
+# username and password.
+run "$BIN/serenity-login-server"
+
+wait $WS_PID
+kill $CONFIG_PID $LAUNCH_PID 2>/dev/null || true

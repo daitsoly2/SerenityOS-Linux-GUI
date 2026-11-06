@@ -1,0 +1,6 @@
+[App]
+Name=输入法设置
+Executable=/bin/ImeSettings
+Category=Settings
+Description=配置中文输入法（仅 Rime）、常见模糊音与每页候选数量
+ExcludeFromSystemMenu=true

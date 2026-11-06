@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+"""Generate GTK and Qt themes from a SerenityOS theme file.
+
+SerenityOS themes are plain INI files with a [Colors] section
+(Base/res/themes/*.ini). This turns one of them into something GTK/Qt
+applications can wear, so ported apps stop looking like a different OS.
+
+The visual language it copies from SerenityOS:
+  - square corners (no border radius)
+  - 1px hard borders, light highlight / dark shadow instead of soft shadows
+  - the classic "3D face" grey for buttons and window backgrounds
+  - a single accent colour for titles and selections
+
+Usage:
+    serenity-theme-gen.py --out /usr                       # install system-wide
+    serenity-theme-gen.py --theme Dark --out /tmp/themes   # pick another theme
+    serenity-theme-gen.py --list                           # show what is available
+"""
+
+import argparse
+import os
+import sys
+
+# SerenityOS accepts these colour names in theme files.
+NAMED_COLORS = {
+    "white": "#ffffff",
+    "black": "#000000",
+    "red": "#ff0000",
+    "green": "#00ff00",
+    "blue": "#0000ff",
+    "magenta": "#ff00ff",
+    "cyan": "#00ffff",
+    "yellow": "#ffff00",
+    "orange": "#ffa500",
+    "gray": "#808080",
+    "grey": "#808080",
+    "darkgray": "#404040",
+    "lightgray": "#c0c0c0",
+    "transparent": "#000000",
+}
+
+
+def find_theme_dir():
+    """Locate Base/res/themes, either from the repo or from an installed /res."""
+    candidates = [
+        os.environ.get("SERENITY_THEME_DIR"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Base", "res", "themes"),
+        "/res/themes",
+        "/usr/share/serenity/themes",
+    ]
+    for path in candidates:
+        if path and os.path.isdir(path):
+            return os.path.normpath(path)
+    return None
+
+
+def parse_ini(path):
+    section = None
+    values = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        for raw in handle:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if section == "Colors":
+                values[key.strip()] = value.strip()
+    return values
+
+
+def normalize_hex(value):
+    """#rgb -> #rrggbb, #rrggbbaa -> #rrggbb (GTK CSS has no 8-digit hex)."""
+    value = value.lower()
+    if not value.startswith("#"):
+        return value
+    digits = value[1:]
+    if len(digits) == 3:
+        digits = "".join(ch * 2 for ch in digits)
+    elif len(digits) == 8:
+        digits = digits[:6]
+    return "#" + digits
+
+
+def resolve(colors, name, depth=0):
+    """Resolve a colour key, following references like `Button=Window`."""
+    if depth > 8:
+        return "#000000"
+    value = colors.get(name)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered in NAMED_COLORS:
+        return NAMED_COLORS[lowered]
+    if lowered.startswith("#"):
+        return normalize_hex(lowered)
+    # A key naming another key.
+    if lowered in (k.lower() for k in colors):
+        for key in colors:
+            if key.lower() == lowered:
+                return resolve(colors, key, depth + 1)
+    return None
+
+
+def palette(colors):
+    """Pull the handful of roles we need, with sensible fallbacks."""
+    def pick(*names, default="#000000"):
+        for name in names:
+            value = resolve(colors, name)
+            if value:
+                return value
+        return default
+
+    return {
+        "bg": pick("Window", default="#d4d0c8"),
+        "fg": pick("WindowText", default="#000000"),
+        "base": pick("Base", default="#ffffff"),
+        "text": pick("BaseText", default="#000000"),
+        "button": pick("Button", "Window", default="#d4d0c8"),
+        "button_text": pick("ButtonText", "WindowText", default="#000000"),
+        "selection": pick("Selection", "Accent", default="#84351a"),
+        "selection_text": pick("SelectionText", default="#ffffff"),
+        "menu_bg": pick("MenuBase", default="#ffffff"),
+        "menu_fg": pick("MenuBaseText", default="#000000"),
+        "tooltip": pick("Tooltip", default="#ffffe1"),
+        "accent": pick("Accent", default="#ab6e4a"),
+        "border": pick("ThreedShadow1", default="#808080"),
+        "highlight": pick("ThreedHighlight", default="#ffffff"),
+        "hover": pick("HoverHighlight", "Button", default="#e3dfdb"),
+        "disabled": pick("DisabledTextFront", default="#808080"),
+        "titlebar": pick("ActiveWindowTitleStripes", "Accent", default="#6e2209"),
+        "titlebar_fg": pick("ActiveWindowTitle", default="#ffffff"),
+        "titlebar_inactive": pick("InactiveWindowTitleStripes", "ThreedShadow1", default="#808080"),
+    }
+
+
+GTK3_CSS = """/* Generated by serenity-theme-gen: Windows 2000 look for GTK3.
+   Palette: #d4d0c8 face, #808080/#404040 shadows, #ffffff highlights,
+   #000080 selection, navy gradient title bars. */
+
+@define-color theme_bg_color #d4d0c8;
+@define-color theme_fg_color #000000;
+@define-color theme_base_color #ffffff;
+@define-color theme_text_color #000000;
+@define-color theme_selected_bg_color #000080;
+@define-color theme_selected_fg_color #ffffff;
+@define-color accent_color #000080;
+@define-color insensitive_fg_color #808080;
+@define-color serenity_border #808080;
+
+* {{ font-family: "MS Sans Serif", "Tahoma", "DejaVu Sans"; }}
+
+/* Focus is a dotted 1px rectangle, exactly like the Win2000 focus cue. */
+* {{
+  outline-color: #000000;
+  outline-style: dotted;
+  outline-width: 1px;
+  outline-offset: -3px;
+}}
+
+window, .background {{ background-color: #d4d0c8; color: #000000; }}
+
+/* Raised 3D button: white top-left, #808080/#404040 bottom-right. */
+button {{
+  background-image: none;
+  background-color: #d4d0c8;
+  color: #000000;
+  border: 1px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  border-radius: 0;
+  box-shadow: inset -1px -1px 0 #808080, inset 1px 1px 0 #dfdfdf;
+  padding: 2px 10px;
+  text-shadow: none;
+  -GtkButton-default-border: 0;
+}}
+
+button:hover {{ background-color: #e4e0d8; }}
+button:active, button:checked, button:checked:hover {{
+  border-color: #404040 #ffffff #ffffff #404040;
+  box-shadow: inset 1px 1px 0 #808080, inset -1px -1px 0 #dfdfdf;
+  padding: 3px 9px 1px 11px;
+}}
+button:disabled {{ color: #808080; }}
+button:disabled label {{ color: #808080; }}
+
+/* Sunken white field. */
+entry, spinbutton, .entry {{
+  background-image: none;
+  background-color: #ffffff;
+  color: #000000;
+  border: 1px solid;
+  border-color: #808080 #ffffff #ffffff #808080;
+  border-radius: 0;
+  box-shadow: inset 1px 1px 0 #404040;
+  padding: 2px;
+}}
+entry:focus, spinbutton:focus {{ border-color: #000000 #ffffff #ffffff #000000; }}
+
+textview text, .view, iconview, treeview.view {{
+  background-color: #ffffff;
+  color: #000000;
+}}
+
+selection, *:selected, .view:selected, treeview.view:selected {{
+  background-color: #000080;
+  color: #ffffff;
+}}
+
+/* Navy gradient title bar, white bold text. */
+headerbar, .titlebar, .titlebar > box {{
+  background-image: linear-gradient(to right, #0a246a, #a6caf0);
+  background-color: #0a246a;
+  color: #ffffff;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  min-height: 22px;
+  padding: 0 4px;
+}}
+headerbar:backdrop, .titlebar:backdrop {{
+  background-image: linear-gradient(to right, #808080, #c0c0c0);
+  color: #d4d0c8;
+}}
+headerbar button, .titlebar button {{
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: inherit;
+  padding: 0 6px;
+}}
+headerbar .title, .titlebar .title {{ font-weight: bold; }}
+
+/* Menus: face colour, 1px border, hard drop shadow, navy highlight. */
+menu, .menu, .context-menu, popover, popover.background, popover > .view {{
+  background-color: #d4d0c8;
+  color: #000000;
+  border: 1px solid #808080;
+  border-radius: 0;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+  padding: 2px;
+}}
+menuitem {{ padding: 2px 18px 2px 22px; }}
+menuitem:hover, menu menuitem:hover, .menu menuitem:hover {{
+  background-color: #000080;
+  color: #ffffff;
+}}
+menuitem:disabled {{ color: #808080; }}
+menubar {{ background-color: #d4d0c8; border-bottom: 1px solid #808080; }}
+menubar > menuitem {{ padding: 1px 6px; }}
+
+/* Scrollbar: 16px wide, 3D thumb, arrow buttons. */
+scrollbar {{
+  background-color: #e8e4dc;
+  border: 1px solid #d4d0c8;
+  border-radius: 0;
+}}
+scrollbar slider {{
+  background-color: #d4d0c8;
+  border: 1px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  box-shadow: inset -1px -1px 0 #808080, inset 1px 1px 0 #dfdfdf;
+  border-radius: 0;
+  min-width: 14px;
+  min-height: 14px;
+}}
+scrollbar slider:hover {{ background-color: #e4e0d8; }}
+scrollbar button {{
+  background-color: #d4d0c8;
+  border: 1px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  box-shadow: inset -1px -1px 0 #808080;
+  border-radius: 0;
+  min-width: 14px;
+  min-height: 14px;
+}}
+
+checkbutton check, radiobutton radio {{
+  background-color: #ffffff;
+  border: 1px solid;
+  border-color: #808080 #ffffff #ffffff #808080;
+  box-shadow: inset 1px 1px 0 #404040;
+  border-radius: 0;
+  min-width: 12px;
+  min-height: 12px;
+}}
+checkbutton check:checked {{ background-color: #ffffff; color: #000080; }}
+radiobutton radio:checked {{ background-color: #ffffff; color: #000080; }}
+
+notebook > header {{ background-color: #d4d0c8; border: none; }}
+notebook > header > tabs > tab {{
+  background-color: #d4d0c8;
+  border: 1px solid;
+  border-color: #ffffff #404040 transparent #ffffff;
+  border-radius: 0;
+  padding: 2px 8px;
+}}
+notebook > header > tabs > tab:checked {{ padding-top: 1px; }}
+
+progressbar trough {{
+  background-color: #ffffff;
+  border: 1px solid;
+  border-color: #808080 #ffffff #ffffff #808080;
+  border-radius: 0;
+  box-shadow: inset 1px 1px 0 #404040;
+}}
+progressbar progress {{ background-color: #000080; border-radius: 0; }}
+
+treeview.view header button {{
+  background-color: #d4d0c8;
+  border: 1px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  box-shadow: inset -1px -1px 0 #808080;
+  border-radius: 0;
+}}
+
+tooltip {{
+  background-color: #ffffe1;
+  color: #000000;
+  border: 1px solid #000000;
+  border-radius: 0;
+  box-shadow: none;
+}}
+
+separator {{ background-color: #808080; min-width: 1px; min-height: 1px; }}
+
+frame, .frame {{ border: 1px solid #808080; border-radius: 0; }}
+"""
+
+GTK4_CSS = """/* Generated by serenity-theme-gen: Windows 2000 look for GTK4. */
+
+@define-color theme_bg_color #d4d0c8;
+@define-color theme_fg_color #000000;
+@define-color theme_base_color #ffffff;
+@define-color theme_text_color #000000;
+@define-color theme_selected_bg_color #000080;
+@define-color theme_selected_fg_color #ffffff;
+@define-color accent_bg_color #000080;
+@define-color accent_color #000080;
+@define-color window_bg_color #d4d0c8;
+@define-color window_fg_color #000000;
+@define-color view_bg_color #ffffff;
+@define-color view_fg_color #000000;
+@define-color headerbar_bg_color #0a246a;
+@define-color headerbar_fg_color #ffffff;
+
+* {{ font-family: "MS Sans Serif", "Tahoma", "DejaVu Sans"; }}
+
+window, .background {{ background-color: #d4d0c8; color: #000000; }}
+
+button {{
+  background-image: none;
+  background-color: #d4d0c8;
+  color: #000000;
+  border: 1px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  border-radius: 0;
+  box-shadow: inset -1px -1px 0 #808080, inset 1px 1px 0 #dfdfdf;
+  padding: 2px 10px;
+  text-shadow: none;
+}}
+button:hover {{ background-color: #e4e0d8; }}
+button:active, button:checked {{
+  border-color: #404040 #ffffff #ffffff #404040;
+  box-shadow: inset 1px 1px 0 #808080;
+}}
+button:disabled {{ color: #808080; }}
+
+entry, spinbutton, .entry {{
+  background-color: #ffffff;
+  color: #000000;
+  border: 1px solid;
+  border-color: #808080 #ffffff #ffffff #808080;
+  border-radius: 0;
+  box-shadow: inset 1px 1px 0 #404040;
+  padding: 2px;
+}}
+
+selection, *:selected {{ background-color: #000080; color: #ffffff; }}
+
+headerbar {{
+  background-image: none;
+  background-color: #0a246a;
+  color: #ffffff;
+  border-radius: 0;
+  box-shadow: none;
+  min-height: 22px;
+}}
+headerbar button {{ background: transparent; border: none; box-shadow: none; color: inherit; }}
+headerbar .title {{ font-weight: bold; }}
+
+popover, popover > contents, menu {{
+  background-color: #d4d0c8;
+  color: #000000;
+  border: 1px solid #808080;
+  border-radius: 0;
+  box-shadow: 2px 2px 0 rgba(0, 0, 0, 0.35);
+  padding: 2px;
+}}
+
+scrollbar {{ background-color: #e8e4dc; border-radius: 0; }}
+scrollbar slider {{
+  background-color: #d4d0c8;
+  border: 1px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  border-radius: 0;
+  min-width: 14px;
+  min-height: 14px;
+}}
+
+checkbutton check, radiobutton radio {{
+  background-color: #ffffff;
+  border: 1px solid;
+  border-color: #808080 #ffffff #ffffff #808080;
+  border-radius: 0;
+}}
+
+tooltip {{ background-color: #ffffe1; color: #000000; border: 1px solid #000000; border-radius: 0; }}
+"""
+
+# libadwaita keeps its own palette: AdwWindow and friends read @window_bg_color,
+# @headerbar_bg_color, @accent_bg_color ... and load their stylesheet *after* the
+# GTK theme, so defining the GTK-level colours is not enough. This file re-points
+# every libadwaita name at the Serenity palette; install it as the user stylesheet
+# ($XDG_CONFIG_HOME/gtk-4.0/gtk.css), which GTK applies last.
+LIBADWAITA_CSS = """/* Generated by serenity-theme-gen: Windows 2000 palette for libadwaita.
+   Install as ~/.config/gtk-4.0/gtk.css so it wins over libadwaita's own
+   stylesheet (it defines these names itself, after the GTK theme). */
+
+@define-color window_bg_color #d4d0c8;
+@define-color window_fg_color #000000;
+@define-color view_bg_color #ffffff;
+@define-color view_fg_color #000000;
+@define-color headerbar_bg_color #0a246a;
+@define-color headerbar_fg_color #ffffff;
+@define-color headerbar_border_color #808080;
+@define-color headerbar_backdrop_color #808080;
+@define-color headerbar_shade_color rgba(0, 0, 0, 0.2);
+@define-color card_bg_color #d4d0c8;
+@define-color card_fg_color #000000;
+@define-color card_shade_color rgba(0, 0, 0, 0.1);
+@define-color dialog_bg_color #d4d0c8;
+@define-color dialog_fg_color #000000;
+@define-color popover_bg_color #d4d0c8;
+@define-color popover_fg_color #000000;
+@define-color sidebar_bg_color #d4d0c8;
+@define-color sidebar_fg_color #000000;
+@define-color sidebar_backdrop_color #d4d0c8;
+@define-color sidebar_shade_color rgba(0, 0, 0, 0.1);
+@define-color accent_bg_color #000080;
+@define-color accent_fg_color #ffffff;
+@define-color accent_color #000080;
+@define-color destructive_bg_color #800000;
+@define-color destructive_fg_color #ffffff;
+@define-color success_bg_color #008000;
+@define-color warning_bg_color #808000;
+@define-color error_bg_color #800000;
+@define-color shade_color rgba(0, 0, 0, 0.1);
+@define-color scrollbar_outline_color #808080;
+
+window, .background, headerbar, popover, popover > contents, menu, .card,
+.dialog, .view, listview, list, entry, button, .sidebar, notebook > header,
+tabbar, .toolbar, .osd {{ border-radius: 0; box-shadow: none; }}
+
+/* Raised 3D face on every control, sunken fields - the Win2000 cue. */
+button {{
+  background-image: none;
+  background-color: #d4d0c8;
+  color: #000000;
+  border: 1px solid;
+  border-color: #ffffff #404040 #404040 #ffffff;
+  box-shadow: inset -1px -1px 0 #808080, inset 1px 1px 0 #dfdfdf;
+}}
+button:active, button:checked {{
+  border-color: #404040 #ffffff #ffffff #404040;
+  box-shadow: inset 1px 1px 0 #808080;
+}}
+entry {{
+  background-color: #ffffff;
+  border: 1px solid;
+  border-color: #808080 #ffffff #ffffff #808080;
+  box-shadow: inset 1px 1px 0 #404040;
+}}
+/* The header bar is navy: keep its own buttons flat and white on it. */
+headerbar button, headerbar menubutton > button {{
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  color: #ffffff;
+}}
+headerbar .title {{ font-weight: bold; }}
+"""
+
+INDEX_THEME = """[Desktop Entry]
+Type=X-GNOME-Metatheme
+Name=Serenity
+Comment=SerenityOS colours, generated by serenity-theme-gen
+Encoding=UTF-8
+
+[X-GNOME-Metatheme]
+GtkTheme=Serenity
+MetacityTheme=Serenity
+IconTheme=Adwaita
+CursorTheme=Adwaita
+"""
+
+QT_QSS = """/* Generated by serenity-theme-gen from the SerenityOS "{theme}" theme.
+   Use with: QT_STYLE_OVERRIDE=Fusion  and  -stylesheet <this file> */
+
+QWidget {{ background-color: {bg}; color: {fg}; }}
+QPushButton, QToolButton {{
+  background-color: {button}; color: {button_text};
+  border: 1px solid {border}; border-radius: 0; padding: 3px 10px;
+}}
+QPushButton:hover {{ background-color: {hover}; }}
+QPushButton:pressed {{ background-color: {selection}; color: {selection_text}; }}
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {{
+  background-color: {base}; color: {text};
+  border: 1px solid {border}; border-radius: 0;
+}}
+QMenuBar, QMenu, QToolBar {{ background-color: {menu_bg}; color: {menu_fg}; }}
+QMenu::item:selected {{ background-color: {selection}; color: {selection_text}; }}
+QHeaderView::section {{
+  background-color: {button}; color: {button_text};
+  border: 1px solid {border}; border-radius: 0;
+}}
+QScrollBar:vertical, QScrollBar:horizontal {{ background: {bg}; border: none; }}
+QScrollBar::handle {{ background: {border}; border-radius: 0; }}
+QToolTip {{ background-color: {tooltip}; color: {menu_fg}; border: 1px solid {border}; }}
+"""
+
+QT_COLORS = """[ColorScheme]
+active_colors={text}, {bg}, {button}, {fg}, {text}, {menu_fg}, {menu_bg}, {button_text}, {button}, {bg}, {base}, {bg}, {text}, {selection}, {selection_text}, {selection_text}, {bg}, {fg}, {button}, {fg}, {menu_bg}
+disabled_colors={disabled}, {bg}, {button}, {disabled}, {disabled}, {disabled}, {menu_bg}, {disabled}, {button}, {bg}, {base}, {bg}, {disabled}, {disabled}, {bg}, {bg}, {bg}, {disabled}, {button}, {disabled}, {menu_bg}
+inactive_colors={text}, {bg}, {button}, {fg}, {text}, {menu_fg}, {menu_bg}, {button_text}, {button}, {bg}, {base}, {bg}, {text}, {titlebar_inactive}, {selection_text}, {selection_text}, {bg}, {fg}, {button}, {fg}, {menu_bg}
+"""
+
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--theme", default="Default", help="theme name (Base/res/themes/<name>.ini) or a path to an .ini")
+    parser.add_argument("--out", default="/usr", help="install prefix (default: /usr)")
+    parser.add_argument("--list", action="store_true", help="list available themes and exit")
+    args = parser.parse_args()
+
+    theme_dir = find_theme_dir()
+    if theme_dir is None:
+        print("error: cannot find Base/res/themes (set SERENITY_THEME_DIR)", file=sys.stderr)
+        return 1
+
+    if args.list:
+        for name in sorted(os.listdir(theme_dir)):
+            if name.endswith(".ini"):
+                print(os.path.splitext(name)[0])
+        return 0
+
+    path = args.theme if os.path.isfile(args.theme) else os.path.join(theme_dir, args.theme + ".ini")
+    if not os.path.isfile(path):
+        print(f"error: theme not found: {path}", file=sys.stderr)
+        return 1
+
+    colors = parse_ini(path)
+    if not colors:
+        print(f"error: no [Colors] section in {path}", file=sys.stderr)
+        return 1
+
+    theme_name = os.path.splitext(os.path.basename(path))[0]
+    values = palette(colors)
+
+    theme_root = os.path.join(args.out, "share", "themes", "Serenity")
+    written = [
+        write(os.path.join(theme_root, "index.theme"), INDEX_THEME),
+        write(os.path.join(theme_root, "gtk-3.0", "gtk.css"), GTK3_CSS.format(theme=theme_name, **values)),
+        write(os.path.join(theme_root, "gtk-4.0", "gtk.css"), GTK4_CSS.format(theme=theme_name, **values)),
+        write(os.path.join(theme_root, "gtk-4.0", "libadwaita.css"), LIBADWAITA_CSS.format(theme=theme_name, **values)),
+        write(os.path.join(args.out, "share", "serenity", "qt-style.qss"), QT_QSS.format(theme=theme_name, **values)),
+        write(os.path.join(args.out, "share", "serenity", "qt-colors.conf"), QT_COLORS.format(**values)),
+    ]
+
+    for item in written:
+        print(item)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

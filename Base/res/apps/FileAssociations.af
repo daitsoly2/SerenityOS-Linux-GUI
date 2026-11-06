@@ -1,0 +1,6 @@
+[App]
+Name=文件关联
+Executable=/bin/FileAssociations
+Category=Settings
+Description=查看和更改各类文件的默认打开程序
+ExcludeFromSystemMenu=true

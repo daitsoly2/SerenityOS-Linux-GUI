@@ -1,0 +1,3 @@
+# SerenityOS AudioServer opens /dev/audio/0, which on SerenityOS is a channel
+# node inside the /dev/audio directory. Link our misc device into that shape.
+KERNEL=="serenity_audio0", SUBSYSTEM=="misc", SYMLINK+="audio/0", MODE="0666"

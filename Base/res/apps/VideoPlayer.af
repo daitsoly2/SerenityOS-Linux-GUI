@@ -1,0 +1,12 @@
+[App]
+Name=&Video Player
+Executable=/bin/VideoPlayer
+Category=&Media
+
+[Launcher]
+# libmpv brings FFmpeg's full demuxer/decoder set, so all common video
+# containers are playable (not just the VP8/VP9-in-Matroska that LibMedia
+# used to handle). Keep extensions lowercase: LaunchServer lowercases the
+# extension before looking it up.
+FileTypes=3g2,3gp,asf,avi,divx,dv,f4v,flv,m1v,m2t,m2ts,m2v,m4v,mkv,mov,mp4,mpe,mpg,mpeg,mpv,mts,mxf,ogm,ogv,qt,rm,rmvb,ts,vob,webm,wmv
+MimeTypes=video/mp4,video/x-m4v,video/quicktime,video/x-matroska,video/matroska,video/webm,video/x-msvideo,video/x-ms-wmv,video/x-flv,video/mpeg,video/mp2t,video/ogg,video/3gpp,video/3gpp2,video/x-ms-asf

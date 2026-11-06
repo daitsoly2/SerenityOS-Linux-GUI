@@ -1,0 +1,197 @@
+/*
+ * Copyright (c) 2018-2021, the SerenityOS developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include "ViewWidget.h"
+#include "Defaults.h"
+#include <AK/Assertions.h>
+#include <AK/JsonObject.h>
+#include <AK/QuickSort.h>
+#include <LibConfig/Client.h>
+#include <LibCore/DirIterator.h>
+#include <LibGUI/Application.h>
+#include <LibGUI/Button.h>
+#include <LibGUI/CheckBox.h>
+#include <LibGUI/FontPicker.h>
+#include <LibGUI/ItemListModel.h>
+#include <LibGUI/Label.h>
+#include <LibGUI/MessageBox.h>
+#include <LibGUI/OpacitySlider.h>
+#include <LibGUI/RadioButton.h>
+#include <LibGUI/SpinBox.h>
+#include <LibGUI/Widget.h>
+#include <LibGfx/Font/Font.h>
+#include <LibGfx/Font/FontDatabase.h>
+#include <LibKeyboard/CharacterMap.h>
+#include <LibVT/TerminalWidget.h>
+#include <spawn.h>
+
+namespace TerminalSettings {
+ErrorOr<NonnullRefPtr<ViewWidget>> ViewWidget::create()
+{
+    auto widget = TRY(ViewWidget::try_create());
+    TRY(widget->setup());
+    return widget;
+}
+
+ErrorOr<void> ViewWidget::setup()
+{
+    m_opacity_slider = find_descendant_of_type_named<GUI::HorizontalOpacitySlider>("background_opacity_slider");
+    m_font_label = find_descendant_of_type_named<GUI::Label>("terminal_font_label");
+    m_font_selection = find_descendant_of_type_named<GUI::Widget>("terminal_font_selection");
+    m_use_default_font_checkbox = find_descendant_of_type_named<GUI::CheckBox>("terminal_font_defaulted");
+    m_cursor_block_radio = find_descendant_of_type_named<GUI::RadioButton>("terminal_cursor_block");
+    m_cursor_underline_radio = find_descendant_of_type_named<GUI::RadioButton>("terminal_cursor_underline");
+    m_cursor_bar_radio = find_descendant_of_type_named<GUI::RadioButton>("terminal_cursor_bar");
+    m_cursor_blinking_checkbox = find_descendant_of_type_named<GUI::CheckBox>("terminal_cursor_blinking");
+    m_history_size_spinbox = find_descendant_of_type_named<GUI::SpinBox>("history_size_spinbox");
+    m_show_scrollbar_checkbox = find_descendant_of_type_named<GUI::CheckBox>("terminal_show_scrollbar");
+    auto font_button = find_descendant_of_type_named<GUI::Button>("terminal_font_button");
+
+    m_opacity = Config::read_i32("Terminal"sv, "Window"sv, "Opacity"sv, Terminal::Defaults::OPACITY);
+    m_original_opacity = m_opacity;
+    m_opacity_slider->set_value(m_opacity);
+    m_opacity_slider->on_change = [this](int value) {
+        m_opacity = value;
+        set_modified(true);
+    };
+
+    auto initial_font_name = Config::read_string("Terminal"sv, "Text"sv, "Font"sv);
+    if (initial_font_name.is_empty())
+        m_font = Gfx::FontDatabase::the().default_fixed_width_font();
+    else
+        m_font = Gfx::FontDatabase::the().get_by_name(initial_font_name);
+    m_original_font = m_font;
+    m_font_label->set_text(m_font->human_readable_name());
+    m_font_label->set_font(m_font);
+    font_button->on_click = [this](auto) {
+        auto picker = GUI::FontPicker::construct(window(), m_font.ptr(), true);
+        if (picker->exec() == GUI::Dialog::ExecResult::OK) {
+            m_font = picker->font();
+            m_font_label->set_text(m_font->human_readable_name());
+            m_font_label->set_font(m_font);
+            set_modified(true);
+        }
+    };
+
+    // The "use default font" setting is not stored itself - we automatically set it if the actually present font is the default,
+    // whether that was filled in by the above defaulting code or by the user.
+    m_use_default_font_checkbox->set_checked(m_font == Gfx::FontDatabase::the().default_fixed_width_font());
+    m_use_default_font_checkbox->on_checked = [this, initial_font_name](bool use_default_font) {
+        if (use_default_font) {
+            m_font_selection->set_enabled(false);
+            m_font = Gfx::FontDatabase::the().default_fixed_width_font();
+            m_font_label->set_text(m_font->human_readable_name());
+            m_font_label->set_font(m_font);
+        } else {
+            m_font_selection->set_enabled(true);
+            m_font = initial_font_name.is_empty()
+                ? Gfx::FontDatabase::the().default_fixed_width_font()
+                : Gfx::FontDatabase::the().get_by_name(initial_font_name);
+        }
+        set_modified(true);
+    };
+    m_font_selection->set_enabled(!m_use_default_font_checkbox->is_checked());
+
+    m_cursor_shape = VT::TerminalWidget::parse_cursor_shape(Config::read_string("Terminal"sv, "Cursor"sv, "Shape"sv)).value_or(Terminal::Defaults::CURSOR_SHAPE);
+    m_original_cursor_shape = m_cursor_shape;
+
+    m_cursor_is_blinking_set = Config::read_bool("Terminal"sv, "Cursor"sv, "Blinking"sv, Terminal::Defaults::CURSOR_BLINKING);
+    m_original_cursor_is_blinking_set = m_cursor_is_blinking_set;
+
+    switch (m_cursor_shape) {
+    case VT::CursorShape::Underline:
+        m_cursor_underline_radio->set_checked(true);
+        break;
+    case VT::CursorShape::Bar:
+        m_cursor_bar_radio->set_checked(true);
+        break;
+    default:
+        m_cursor_block_radio->set_checked(true);
+    }
+
+    m_cursor_blinking_checkbox->set_checked(Config::read_bool("Terminal"sv, "Cursor"sv, "Blinking"sv, Terminal::Defaults::CURSOR_BLINKING), GUI::AllowCallback::No);
+    m_cursor_blinking_checkbox->on_checked = [this](bool is_checked) {
+        set_modified(true);
+        m_cursor_is_blinking_set = is_checked;
+    };
+
+    m_cursor_block_radio->on_checked = [this](bool) {
+        set_modified(true);
+        m_cursor_shape = VT::CursorShape::Block;
+    };
+    m_cursor_underline_radio->on_checked = [this](bool) {
+        set_modified(true);
+        m_cursor_shape = VT::CursorShape::Underline;
+    };
+    m_cursor_bar_radio->on_checked = [this](bool) {
+        set_modified(true);
+        m_cursor_shape = VT::CursorShape::Bar;
+    };
+
+    m_max_history_size = Config::read_i32("Terminal"sv, "Terminal"sv, "MaxHistorySize"sv, Terminal::Defaults::MAX_HISTORY_SIZE);
+    m_original_max_history_size = m_max_history_size;
+    m_history_size_spinbox->set_value(m_max_history_size);
+    m_history_size_spinbox->on_change = [this](int value) {
+        m_max_history_size = value;
+        set_modified(true);
+    };
+
+    m_show_scrollbar = Config::read_bool("Terminal"sv, "Terminal"sv, "ShowScrollBar"sv, Terminal::Defaults::SHOW_SCROLLBAR);
+    m_original_show_scrollbar = m_show_scrollbar;
+    m_show_scrollbar_checkbox->set_checked(m_show_scrollbar);
+    m_show_scrollbar_checkbox->on_checked = [this](bool show_scrollbar) {
+        m_show_scrollbar = show_scrollbar;
+        set_modified(true);
+    };
+    return {};
+}
+
+void ViewWidget::apply_settings()
+{
+    m_original_opacity = m_opacity;
+    m_original_font = m_font;
+    m_original_cursor_shape = m_cursor_shape;
+    m_original_cursor_is_blinking_set = m_cursor_is_blinking_set;
+    m_original_max_history_size = m_max_history_size;
+    m_original_show_scrollbar = m_show_scrollbar;
+    write_back_settings();
+}
+
+void ViewWidget::write_back_settings() const
+{
+    Config::write_i32("Terminal"sv, "Window"sv, "Opacity"sv, static_cast<i32>(m_original_opacity));
+    Config::write_string("Terminal"sv, "Text"sv, "Font"sv, m_original_font->qualified_name());
+    Config::write_string("Terminal"sv, "Cursor"sv, "Shape"sv, VT::TerminalWidget::stringify_cursor_shape(m_original_cursor_shape));
+    Config::write_bool("Terminal"sv, "Cursor"sv, "Blinking"sv, m_original_cursor_is_blinking_set);
+    Config::write_i32("Terminal"sv, "Terminal"sv, "MaxHistorySize"sv, static_cast<i32>(m_original_max_history_size));
+    Config::write_bool("Terminal"sv, "Terminal"sv, "ShowScrollBar"sv, m_original_show_scrollbar);
+}
+
+void ViewWidget::cancel_settings()
+{
+    write_back_settings();
+}
+
+void ViewWidget::reset_default_values()
+{
+    m_opacity = Terminal::Defaults::OPACITY;
+    m_cursor_shape = Terminal::Defaults::CURSOR_SHAPE;
+    m_cursor_is_blinking_set = Terminal::Defaults::CURSOR_BLINKING;
+    m_max_history_size = Terminal::Defaults::MAX_HISTORY_SIZE;
+    m_show_scrollbar = Terminal::Defaults::SHOW_SCROLLBAR;
+    m_font = Gfx::FontDatabase::the().default_fixed_width_font();
+
+    m_opacity_slider->set_value(m_opacity, GUI::AllowCallback::No);
+    m_font_label->set_text(m_font->human_readable_name());
+    m_font_label->set_font(m_font);
+    m_font_selection->set_enabled(false);
+    m_use_default_font_checkbox->set_checked(true, GUI::AllowCallback::No);
+    m_cursor_block_radio->set_checked(true, GUI::AllowCallback::No);
+    m_cursor_blinking_checkbox->set_checked(m_cursor_is_blinking_set, GUI::AllowCallback::No);
+    m_history_size_spinbox->set_value(m_max_history_size, GUI::AllowCallback::No);
+    m_show_scrollbar_checkbox->set_checked(m_show_scrollbar, GUI::AllowCallback::No);
+}
+}

@@ -1,0 +1,5 @@
+[App]
+Name=Web Browser
+Executable=/bin/WebBrowser
+Category=&Internet
+Icon=/res/icons/32x32/app-browser.png

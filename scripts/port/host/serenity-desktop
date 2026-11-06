@@ -1,0 +1,13 @@
+#!/bin/sh
+# Start the SerenityOS desktop shell (Taskbar). Invoked by the login server once
+# a user is authenticated, or directly when autologin is configured.
+set -u
+
+BIN=${SERENITY_BIN:-/home/serenity/serenity/Build/lagom/bin}
+LOG=/var/log/serenity-session.log
+export LD_LIBRARY_PATH=${BIN%/bin}/lib
+
+# One Taskbar per session.
+pgrep -x serenity-taskba >/dev/null 2>&1 && exit 0
+
+exec "$BIN/serenity-taskbar" >>"$LOG" 2>&1

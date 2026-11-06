@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Minesweeper
+Exec=/bin/Minesweeper
+Icon=/res/icons/32x32/app-minesweeper.png
+Type=Application

@@ -1,0 +1,10 @@
+[App]
+Name=Text &Editor
+Executable=/bin/TextEditor
+Category=&Utilities
+
+[Launcher]
+# Plain text and source/config files the text editor can display. Note this is
+# the port's Notepad behind /bin/TextEditor, not a browser -- keep markup here
+# too so users can inspect raw source without an editor binary going missing.
+FileTypes=txt,md,markdown,html,htm,js,json,ini,gmi,csv,tsv,xml,yaml,yml,toml,log,sh,bash,zsh,py,c,cc,cpp,cxx,h,hh,hpp,rs,go,java,cs,rb,pl,php,lua,sql,css,scss,less,ts,tsx,jsx,cmake,conf,cfg,properties,diff,patch,tex,bib,mk,make,gradle,gitignore,dockerfile

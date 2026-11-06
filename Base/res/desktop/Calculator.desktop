@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Calculator
+Exec=/bin/Calculator
+Icon=/res/icons/32x32/app-calculator.png
+Type=Application

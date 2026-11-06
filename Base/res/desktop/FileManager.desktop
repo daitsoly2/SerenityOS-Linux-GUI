@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=File Manager
+Exec=/bin/FileManager
+Icon=/res/icons/32x32/app-file-manager.png
+Type=Application

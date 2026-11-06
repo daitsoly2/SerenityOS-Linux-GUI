@@ -1,0 +1,5 @@
+[Desktop Entry]
+Name=Settings
+Exec=/bin/Settings
+Icon=/res/icons/32x32/app-settings.png
+Type=Application

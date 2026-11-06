@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 210" font-family="DejaVu Sans, sans-serif">
+  <!-- window background (palette().window() = Win2000 panel gray) -->
+  <rect x="0" y="0" width="360" height="210" fill="#d4d0c8"/>
+  <!-- 3D bevel: light inner edge, dark outer frame -->
+  <rect x="1" y="1" width="358" height="208" fill="none" stroke="#ffffff" stroke-width="1"/>
+  <rect x="0" y="0" width="359" height="209" fill="none" stroke="#808080" stroke-width="1"/>
+
+  <!-- aux / syllable guide (faint) -->
+  <text x="10" y="18" font-size="13" fill="#808080">nǐ hǎo</text>
+
+  <!-- preedit with in-string caret -->
+  <text x="10" y="40" font-size="14" fill="#000000">nihao</text>
+  <line x1="48" y1="29" x2="48" y2="44" stroke="#000000" stroke-width="1.5"/>
+
+  <!-- candidate list: vertical, one per line -->
+  <!-- active item highlighted (palette().selection() = navy, white text) -->
+  <rect x="4" y="54" width="352" height="20" fill="#000080"/>
+  <text x="10" y="69" font-size="13" fill="#ffffff">1</text>
+  <text x="24" y="69" font-size="14" fill="#ffffff">你好</text>
+
+  <text x="10" y="91" font-size="13" fill="#808080">2</text>
+  <text x="24" y="91" font-size="14" fill="#000000">您好</text>
+
+  <text x="10" y="113" font-size="13" fill="#808080">3</text>
+  <text x="24" y="113" font-size="14" fill="#000000">尼好</text>
+
+  <text x="10" y="135" font-size="13" fill="#808080">4</text>
+  <text x="24" y="135" font-size="14" fill="#000000">泥好</text>
+
+  <text x="10" y="157" font-size="13" fill="#808080">5</text>
+  <text x="24" y="157" font-size="14" fill="#000000">你号</text>
+
+  <!-- pager hints (has_prev ">" left, has_next ">" right) -->
+  <text x="10" y="186" font-size="13" fill="#808080">&lt;</text>
+  <text x="334" y="186" font-size="13" fill="#808080" text-anchor="end">&gt;</text>
+</svg>

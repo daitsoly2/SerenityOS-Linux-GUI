@@ -1,0 +1,208 @@
+/*
+ * Copyright (c) 2026, Lucas Chollet <lucas.chollet@serenityos.org>
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include "DataTypes.h"
+#include <AK/Base64.h>
+#include <AK/Endian.h>
+#include <LibCrypto/ASN1/PEM.h>
+#include <LibCrypto/Curves/Ed25519.h>
+
+namespace SSH {
+
+ErrorOr<ByteBuffer> decode_string(FixedMemoryStream& stream)
+{
+    auto length = TRY(stream.read_value<NetworkOrdered<u32>>());
+    auto data = TRY(ByteBuffer::create_uninitialized(length));
+    TRY(stream.read_until_filled(data));
+    return data;
+}
+
+ErrorOr<ByteBuffer> as_mpint(ReadonlyBytes bytes)
+{
+    AllocatingMemoryStream stream;
+    TRY(encode_mpint(stream, bytes));
+    return stream.read_until_eof();
+}
+
+ErrorOr<void> encode_mpint(AllocatingMemoryStream& stream, ReadonlyBytes bytes)
+{
+    VERIFY(bytes.size() > 0);
+
+    auto first_non_null = find_if(bytes.begin(), bytes.end(), [](u8 byte) { return byte != 0; });
+    bool is_all_zeroes = first_non_null == bytes.end();
+
+    bool should_add_leading_zero = !is_all_zeroes && bytes[first_non_null.index()] & 0x80;
+
+    u32 total_length = bytes.size() - first_non_null.index();
+
+    // "If the most significant bit would be set for a positive number,
+    // the number MUST be preceded by a zero byte."
+    if (should_add_leading_zero)
+        total_length += 1;
+
+    TRY(stream.write_value<NetworkOrdered<u32>>(total_length));
+    if (should_add_leading_zero)
+        TRY(stream.write_value<NetworkOrdered<u8>>(0));
+    TRY(stream.write_until_depleted(bytes.slice(first_non_null.index())));
+    return {};
+}
+
+ErrorOr<void> encode_string(AllocatingMemoryStream& stream, StringView string)
+{
+    TRY(stream.write_value<NetworkOrdered<u32>>(string.length()));
+    TRY(stream.write_until_depleted(string));
+    return {};
+}
+
+ErrorOr<void> encode_name_list(AllocatingMemoryStream& stream, Span<StringView const> names)
+{
+    u64 total_length {};
+    for (auto name : names) {
+        total_length += name.length();
+    }
+    if (names.size() > 1)
+        total_length += names.size() - 1;
+
+    if (total_length > NumericLimits<u32>::max())
+        return Error::from_string_literal("Name list is too long");
+
+    TRY(stream.write_value<NetworkOrdered<u32>>(total_length));
+    for (u32 i = 0; i < names.size(); i++) {
+        TRY(stream.write_until_depleted(names[i]));
+        if (i != names.size() - 1)
+            TRY(stream.write_until_depleted(","sv));
+    }
+    return {};
+}
+
+// 6.6.  Public Key Algorithms
+// https://datatracker.ietf.org/doc/html/rfc4253#section-6.6
+ErrorOr<void> TypedBlob::encode(AllocatingMemoryStream& stream) const
+{
+    // "Signatures are encoded as follows:
+    //      string    signature format identifier (as specified by the
+    //                public key/certificate format)
+    //      byte[n]   signature blob in format specific encoding."
+    AllocatingMemoryStream local_stream;
+
+    TRY(encode_string(local_stream, type_to_string(type)));
+
+    TRY(encode_string(local_stream, key));
+
+    auto encoded = TRY(local_stream.read_until_eof());
+    TRY(stream.write_value<NetworkOrdered<u32>>(encoded.size()));
+    TRY(stream.write_until_depleted(encoded));
+
+    return {};
+}
+
+StringView TypedBlob::type_to_string(Type t)
+{
+    switch (t) {
+    case Type::SSH_ED25519:
+        return "ssh-ed25519"sv;
+    }
+    VERIFY_NOT_REACHED();
+}
+
+namespace {
+
+ErrorOr<TypedBlob> decode_already_unpacked(FixedMemoryStream& stream)
+{
+    auto type = TRY(decode_string(stream));
+
+    if (type != "ssh-ed25519"sv.bytes())
+        return Error::from_string_literal("Invalid key type");
+
+    auto key = TRY(decode_string(stream));
+    return TypedBlob { .type = TypedBlob::Type::SSH_ED25519, .key = move(key) };
+}
+
+}
+
+ErrorOr<TypedBlob> TypedBlob::decode(FixedMemoryStream& stream)
+{
+    auto inner = TRY(decode_string(stream));
+    FixedMemoryStream inner_stream { inner.bytes() };
+
+    return decode_already_unpacked(inner_stream);
+}
+
+ErrorOr<TypedBlob> TypedBlob::read_from_string(StringView input)
+{
+    auto tokens = input.split_view(' ');
+
+    if (tokens.size() != 3)
+        return Error::from_string_literal("Invalid public key file");
+
+    auto const& algorithm_name_ascii = tokens[0];
+
+    auto base64_decoded_blob = TRY(decode_base64(tokens[1]));
+    auto stream = FixedMemoryStream { base64_decoded_blob.bytes() };
+    auto blob = TRY(decode_already_unpacked(stream));
+
+    if (algorithm_name_ascii != type_to_string(blob.type))
+        return Error::from_string_literal("Incoherent algorithm name");
+
+    return blob;
+}
+
+// The format is documented at [1] source code at [2]
+// [1] https://coolaj86.com/articles/the-openssh-private-key-format/
+// [2] https://github.com/openssh/openssh-portable/blob/master/sshkey.c
+ErrorOr<TypedBlob> TypedBlob::read_from_openssh_private_key(StringView input)
+{
+    auto buffer = Crypto::decode_pem(input.bytes());
+    FixedMemoryStream inner_stream { buffer.bytes() };
+
+    static constexpr auto magic_bytes = "openssh-key-v1\0"sv;
+    Array<u8, magic_bytes.length()> data;
+    TRY(inner_stream.read_until_filled(data));
+    if (data != magic_bytes.bytes())
+        return Error::from_string_literal("Unsupported private key file");
+
+    auto cipher_name = TRY(decode_string(inner_stream));
+    if (cipher_name != "none"sv.bytes())
+        return Error::from_string_literal("Unsupported cipher name");
+
+    auto kdfname = TRY(decode_string(inner_stream));
+    if (kdfname != "none"sv.bytes())
+        return Error::from_string_literal("Unsupported kdf name");
+
+    auto number_of_kdf = TRY(inner_stream.read_value<NetworkOrdered<u32>>());
+    if (number_of_kdf != 0)
+        return Error::from_string_literal("Key has kdf");
+
+    auto number_of_keys = TRY(inner_stream.read_value<NetworkOrdered<u32>>());
+    if (number_of_keys != 1)
+        return Error::from_string_literal("File has more than one key");
+
+    auto public_key = TRY(TypedBlob::decode(inner_stream));
+
+    [[maybe_unused]] auto private_key_length = TRY(inner_stream.read_value<NetworkOrdered<u32>>());
+    [[maybe_unused]] u64 maybe_checksum = TRY(inner_stream.read_value<NetworkOrdered<u64>>());
+    auto key_type = TRY(decode_string(inner_stream));
+    if (key_type != type_to_string(public_key.type).bytes())
+        return Error::from_string_literal("Invalid private key type");
+
+    auto embedded_public_key = TRY(decode_string(inner_stream));
+    if (embedded_public_key != public_key.key)
+        return Error::from_string_literal("Mismatch between public and embedded public key");
+
+    auto private_key = TRY(decode_string(inner_stream));
+
+    if (private_key.span().slice(32) != public_key.key)
+        return Error::from_string_literal("Mismatch between public and second embedded public key");
+
+    if (TRY(Crypto::Curves::Ed25519::generate_public_key(private_key.bytes().trim(32))) != public_key.key)
+        return Error::from_string_literal("Mismatch between public and private key");
+
+    // The file still has a comment + padding.
+
+    return TypedBlob { .type = Type::SSH_ED25519, .key = TRY(ByteBuffer::copy(private_key.bytes().trim(32))) };
+}
+
+} // SSH

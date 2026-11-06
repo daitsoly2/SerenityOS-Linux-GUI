@@ -1,0 +1,10 @@
+[App]
+Name=Serenity Chrome
+Executable=/bin/Chromium
+Icon=/res/icons/32x32/app-browser.png
+Category=&Internet
+
+[Launcher]
+FileTypes=html,htm
+Protocols=gemini,http,https
+Arguments=--new-window

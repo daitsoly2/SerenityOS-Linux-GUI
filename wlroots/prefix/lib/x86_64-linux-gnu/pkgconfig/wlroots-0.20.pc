@@ -1,0 +1,23 @@
+prefix=${pcfiledir}/../../..
+includedir=${prefix}/include
+libdir=${prefix}/lib/x86_64-linux-gnu
+
+have_drm_backend=false
+have_x11_backend=false
+have_libinput_backend=false
+have_xwayland=false
+have_gles2_renderer=false
+have_vulkan_renderer=false
+have_gbm_allocator=false
+have_udmabuf_allocator=false
+have_session=false
+have_color_management=false
+
+Name: wlroots-0.20
+Description: Wayland compositor library
+URL: https://gitlab.freedesktop.org/wlroots/wlroots
+Version: 0.20.2
+Requires.private: wayland-server >= 1.24.0, libdrm >= 2.4.129, xkbcommon >= 1.8.0, pixman-1 >= 0.43.0, wayland-protocols >= 1.47, wayland-client >= 1.24.0
+Libs: -L${libdir} -lwlroots-0.20
+Libs.private: -lm -lrt
+Cflags: -I${includedir}/wlroots-0.20
