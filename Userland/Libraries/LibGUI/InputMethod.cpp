@@ -1076,4 +1076,16 @@ void InputMethod::request_page(bool next)
     read_until_handled();
 }
 
+
+u32 ime_keysym_for_key_event(KeyEvent const& event)
+{
+    return event_to_keysym(event);
 }
+
+KeyCode ime_key_code_for_keysym(u32 keysym, u32& code_point)
+{
+    return keysym_to_key_code(keysym, code_point);
+}
+
+}
+

@@ -126,6 +126,14 @@ private:
     virtual void set_window_backing_store(i32, i32, i32, IPC::File const&, i32, bool, Gfx::IntSize, Gfx::IntSize, bool) override;
     virtual void set_window_has_alpha_channel(i32, bool) override;
     virtual void set_window_alpha_hit_threshold(i32, float) override;
+    // Colour-key transparency for 24-bit bitmap skins (M4Player
+    // transparent_color=255,0,255). The matching IPC message MUST stay the
+    // LAST entry in WindowServer.ipc: MessageID values follow declaration
+    // order, so inserting one in the middle shifts every later ID and breaks
+    // every client binary that was not rebuilt at the same time.
+    virtual void set_window_transparent_color(i32, Optional<Gfx::Color> const&) override;
+    virtual void set_window_skip_taskbar(i32, bool) override;
+    virtual Messages::WindowServer::GetWindowSkipTaskbarResponse get_window_skip_taskbar(i32, i32) override;
     virtual void move_window_to_front(i32) override;
     virtual void set_fullscreen(i32, bool) override;
     virtual void set_frameless(i32, bool) override;

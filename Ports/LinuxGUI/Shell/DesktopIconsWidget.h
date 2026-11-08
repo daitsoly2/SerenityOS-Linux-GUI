@@ -26,10 +26,24 @@ class DesktopIconsWidget final : public GUI::Widget {
 public:
     virtual ~DesktopIconsWidget() override = default;
 
+    // Icon size is user configurable (right-click -> 图标大小) and persisted in
+    // ~/.config/Desktop.ini [Settings] IconSize. The cell adds room for the
+    // label underneath, so it scales with the icon.
+    int icon_size() const;
+    int cell_width() const { return m_icon_size + 52; }
+    int cell_height() const { return m_icon_size + 44; }
+    void set_icon_size(int);
+
 private:
+    void load_icon_size();
+
+    int m_icon_size { 32 };
+    bool m_icon_size_loaded { false };
+
     struct Entry {
         String label;
         ByteString exec;
+        Vector<ByteString> arguments;
         ByteString icon_path;
         ByteString path;        // optional real file/folder target (for open/compress)
         ByteString source_file; // the .af/.desktop file this entry came from
@@ -38,19 +52,23 @@ private:
         // Plain files and folders that live in ~/Desktop are shown too, but
         // "Remove icon" must not delete them - only shortcut files are ours.
         bool is_shortcut { true };
+        // Target program is gone or the shortcut file no longer parses.
+        bool broken { false };
     };
 
     // Descriptor for a shortcut file on the desktop (either .af or .desktop).
+    // Built by PortShortcuts, so .desktop entries come from the converted .af
+    // cache after the first scan and are not re-converted every refresh.
     struct Shortcut {
         ByteString name;
         ByteString exec;
+        Vector<ByteString> arguments;
         ByteString icon_path;
         ByteString path;        // Path= (a file/folder the shortcut opens)
         ByteString source_file; // full path to the shortcut file
+        bool broken { false };
     };
 
-    static Optional<Shortcut> parse_desktop_file(ByteString const& path);
-    static Optional<Shortcut> parse_af_file(ByteString const& path);
     static void scan_shortcuts(ByteString const& directory, Vector<Shortcut>& out);
 
     void load_shortcuts_into(Vector<Shortcut> const&);

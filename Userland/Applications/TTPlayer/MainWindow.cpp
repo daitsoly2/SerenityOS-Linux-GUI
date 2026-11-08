@@ -168,6 +168,7 @@ MainWindow::MainWindow(NonnullRefPtr<PlayerCore> core)
     if (Config::read_bool(config_domain, "Preferences"sv, "EqualizerWindowVisible"sv, false))
         set_equalizer_window_visible(true);
 
+    apply_window_shape();
     apply_skin_geometry();
 }
 
@@ -190,6 +191,45 @@ void MainWindow::build_ui()
     root_widget->on_close_clicked = [] { GUI::Application::the()->quit(); };
     root_widget->on_context_menu_request = [this](auto& event) { show_context_menu(event); };
     auto& root = *root_widget;
+
+    // Native Skin.xml control names -> playback actions. Classic skins never
+    // create a canvas, so these hooks are simply unused in that mode.
+    root_widget->on_native_action = [this](StringView name) {
+        if (name == "play"sv || name == "pause"sv)
+            m_core->toggle_play_pause();
+        else if (name == "stop"sv)
+            m_core->stop_playback();
+        else if (name == "next"sv)
+            m_core->next_track();
+        else if (name == "prev"sv)
+            m_core->previous_track();
+        else if (name == "open"sv)
+            m_core->add_files(this);
+        else if (name == "mute"sv)
+            m_core->set_muted(!m_core->muted());
+        else if (name == "exit"sv)
+            GUI::Application::the()->quit();
+        else if (name == "minimize"sv)
+            set_minimized(true);
+        else if (name == "playlist"sv)
+            toggle_playlist_window();
+        else if (name == "lyric"sv)
+            toggle_lyrics_window();
+        else if (name == "equalizer"sv)
+            toggle_equalizer_window();
+        else if (name.starts_with("mode_"sv))
+            m_core->cycle_play_mode();
+    };
+    root_widget->on_native_slider = [this](StringView name, float ratio) {
+        if (name == "progress"sv)
+            m_core->seek_to_ms(static_cast<int>(ratio * m_core->duration_ms()));
+        else if (name == "volume"sv)
+            m_core->set_volume(ratio);
+    };
+    root_widget->on_native_canvas_setup = [this](SkinCanvas&) {
+        update_native_canvas();
+    };
+
     root.set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 14, 6, 6 }, 4);
 
     // ---- Row 1: song info + LED clock/state ------------------------------
@@ -273,6 +313,22 @@ void MainWindow::build_ui()
     // Persist once the drag ends: writing the config on every pixel would spam
     // ConfigServer over IPC and can starve the audio feed.
     m_volume->on_drag_end = [this](int) { m_core->persist_volume(); };
+
+    // ---- Spectrum analyzer ----------------------------------------------
+    // Classic skins bake the <visual> box into the backdrop but leave the
+    // bars to the player; the LibGUI layout has no slot for it either, so it
+    // stays hidden until a native canvas claims that element.
+    m_spectrum = SpectrumWidget::construct();
+    m_spectrum->set_samplerate(m_core->sample_rate());
+    // Added outside the vertical box layout on purpose: the spectrum only
+    // exists on top of a native skin's <visual> box and must not reserve a
+    // row in the classic LibGUI layout.
+    root.add_child(*m_spectrum);
+    root_widget->set_content_widget(*m_spectrum, "visual"sv, SkinPanel::ContentFill::ExactBounds, false);
+    m_core->on_audio_buffer = [this](FixedArray<Audio::Sample> const& buffer) {
+        if (m_spectrum)
+            m_spectrum->set_buffer(buffer);
+    };
 }
 
 void MainWindow::build_menus()
@@ -374,7 +430,10 @@ void MainWindow::build_skin_menu(GUI::Menu& view_menu)
 void MainWindow::apply_skin(int index)
 {
     SkinTheme::the().select(index);
+    apply_window_shape();
     apply_skin_geometry();
+    if (auto* panel = static_cast<SkinPanel*>(main_widget()))
+        panel->refresh_native_layout();
     repaint_all();
 }
 
@@ -503,12 +562,46 @@ void MainWindow::apply_skin_geometry()
         auto rect = SkinTheme::the().window_geometry(kind);
         if (!rect.has_value())
             return;
+        // The skin owns the geometry, so its size is also the smallest a
+        // panel may be. Without this the playlist window's own hard-coded
+        // minimum (280x180) beat the skin's 268x165 and the four panels no
+        // longer tiled into the 2x2 grid the skin draws.
+        panel->set_minimum_size(rect->width(), rect->height());
         panel->resize(rect->size());
         panel->move_to(origin + rect->location());
     };
     place(m_playlist_window.ptr(), SkinTheme::WindowKind::Playlist);
     place(m_lyrics_window.ptr(), SkinTheme::WindowKind::Lyrics);
     place(m_equalizer_window.ptr(), SkinTheme::WindowKind::Equalizer);
+}
+
+void MainWindow::apply_window_shape()
+{
+    // Bitmap skins are shaped by their mask colour: tell WindowServer which
+    // RGB is transparent so it both composites the holes and passes mouse
+    // events through them. The classic look stays a plain opaque rectangle.
+    auto color = SkinTheme::the().transparent_color();
+    auto configure = [&](GUI::Window& window) {
+        if (color.has_value()) {
+            window.set_has_alpha_channel(true);
+            window.set_alpha_hit_threshold(1.0f);
+        } else {
+            // Switching from a shaped skin back to a classic one must also
+            // drop the alpha backing store. Leaving it on makes WindowServer
+            // keep clearing the window to transparent and hit-testing against
+            // alpha, so the "opaque" skin still shows see-through gaps.
+            window.set_alpha_hit_threshold(0.0f);
+            window.set_has_alpha_channel(false);
+        }
+        window.set_transparent_color(color);
+    };
+    configure(*this);
+    if (m_playlist_window)
+        configure(*m_playlist_window);
+    if (m_lyrics_window)
+        configure(*m_lyrics_window);
+    if (m_equalizer_window)
+        configure(*m_equalizer_window);
 }
 
 void MainWindow::set_all_windows_on_top(bool on_top)
@@ -591,6 +684,35 @@ void MainWindow::wire_core()
     };
 }
 
+void MainWindow::update_native_canvas()
+{
+    // main_widget() is a plain pointer owned by the Window; do NOT keep an
+    // extra RefPtr on it - that changes the destruction order and trips
+    // RefCounted's m_ref_count > 0 assertion in EventReceiver::~EventReceiver.
+    auto* panel = static_cast<SkinPanel*>(main_widget());
+    if (!panel)
+        return;
+    auto* canvas = panel->native_canvas();
+    if (!canvas || !canvas->has_layout())
+        return;
+
+    auto title = m_core->title();
+    canvas->set_element_text("info"sv, title.is_empty() ? ByteString { "千千静听" } : title);
+    canvas->set_element_text("status"sv, state_text_for(m_core->state()));
+    canvas->set_element_text("stereo"sv, m_core->bitrate_kbps() > 0
+            ? ByteString::formatted("立体声 {}kbps", m_core->bitrate_kbps())
+            : ByteString { "立体声" });
+
+    int position = m_core->position_ms();
+    int duration = m_core->duration_ms();
+    auto clock = [](int seconds) { return ByteString::formatted("{:02}:{:02}", seconds / 60, seconds % 60); };
+    // Native LED strips hold a fixed number of glyph slots (Classic.skn: 5);
+    // show elapsed time only, formatted with the sprite's ':' glyph.
+    canvas->set_element_text("led"sv, clock(position / 1000));
+    canvas->set_element_value("progress"sv, duration > 0 ? static_cast<float>(position) / duration : 0.0f);
+    canvas->set_element_value("volume"sv, static_cast<float>(m_core->volume()));
+}
+
 void MainWindow::sync_from_core()
 {
     m_info_box->set_info(m_core->title(), m_core->artist(), m_core->album());
@@ -622,10 +744,12 @@ void MainWindow::sync_from_core()
         m_playlist_window->refresh();
 
     update_window_title();
+    update_native_canvas();
 }
 
 void MainWindow::sync_position()
 {
+    update_native_canvas();
     if (!m_seek)
         return;
     int position = m_core->position_ms();
@@ -689,6 +813,7 @@ void MainWindow::ensure_secondary_windows()
     }
 
     set_all_windows_on_top(m_always_on_top);
+    apply_window_shape();
     apply_skin_geometry();
 }
 

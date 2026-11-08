@@ -27,6 +27,7 @@
 #include <LibGUI/Button.h>
 #include <LibGUI/ConnectionToWindowManagerServer.h>
 #include <LibGUI/ConnectionToWindowServer.h>
+#include <Ports/LinuxGUI/Shell/TrayAreaWidget.h>
 #include <LibGUI/Desktop.h>
 #include <LibGUI/Frame.h>
 #include <LibGUI/Icon.h>
@@ -205,43 +206,14 @@ ErrorOr<void> TaskbarWindow::populate_taskbar()
 
     m_default_icon = Desktop::icon("window"sv);
 
-    m_applet_area_container = main_widget->add<TaskbarFrame>();
-    // Win2k 的托盘是凹进任务栏的面板（内凹边框），不再是 Vista 玻璃。
-    m_applet_area_container->set_frame_style(Gfx::FrameStyle::SunkenBox);
-    m_applet_area_container->set_fill_with_background_color(false);
-
-    // 托盘音量按钮：VolumeApplet 作为 applet 窗口时在这套移植里点不到（它被
-    // 任务栏窗口盖住），所以做成任务栏自己的按钮，点了开一个独立的音量窗口。
-    m_volume_button = main_widget->add<GUI::Button>();
-    m_volume_button->set_tooltip("Volume"_string);
-    m_volume_button->set_button_style(Gfx::ButtonStyle::Normal);
-    m_volume_button->set_fill_with_background_color(false);
-    m_volume_button->set_fixed_size(22, 22);
-    // Embedded icon held in a member: the old code took bitmap_for_size() from
-    // a temporary Icon, leaving a dangling pointer (blank volume button).
-    m_volume_icon = Desktop::icon("audio-volume-high"sv);
-    m_volume_button->set_icon(m_volume_icon.ptr());
-    m_volume_button->on_click = [this](unsigned) {
-        // 贴着托盘按钮弹出，像 Win9x 的音量托盘飞出面板。
-        constexpr int popup_width = 96;
-        constexpr int popup_height = 240;
-        auto button_rect = m_volume_button->screen_relative_rect();
-        auto x = max(0, button_rect.center().x() - popup_width / 2);
-        auto y = max(0, button_rect.top() - popup_height - 4);
-        Array<ByteString, 2> arguments {
-            ByteString { "--window" },
-            ByteString::formatted("--position={},{}", x, y),
-        };
-        GUI::Process::spawn_or_show_error(this, "/bin/VolumeApplet"sv, ReadonlySpan<ByteString> { arguments.data(), arguments.size() });
-    };
+    // The whole notification area is now one child widget: Linux
+    // StatusNotifierItem icons, volume, system meters, network, clipboard and
+    // IME all live in the same layout. Previously each "native" icon was a
+    // separate top-level Applet window positioned by WindowServer through a
+    // separate IPC call, which drifted whenever the taskbar layout changed.
+    m_applet_area_container = main_widget->add<TrayAreaWidget>();
 
     m_clock_widget = main_widget->add<Taskbar::ClockWidget>();
-
-    // 输入法指示器：任务栏托盘里的"中/EN"按钮，点开切输入法。只读 addon 发的
-    // 状态文件、经控制 socket 发切换命令，不链接任何 fcitx 代码。
-    m_ime_button = main_widget->add<GUI::IMEIndicator>();
-    m_ime_button->set_fill_with_background_color(false);
-    m_ime_button->set_foreground_role(Gfx::ColorRole::TrayText);
 
     m_show_desktop_button = main_widget->add<GUI::Button>();
     m_show_desktop_button->set_tooltip("Show Desktop"_string);
@@ -299,13 +271,11 @@ void TaskbarWindow::on_screen_rects_change(Vector<Gfx::IntRect, 4> const& rects,
 
 void TaskbarWindow::update_applet_area()
 {
-    // NOTE: Widget layout is normally lazy, but here we have to force it right away so we can tell
-    //       WindowServer where to place the applet area window.
-    if (!main_widget())
-        return;
-    main_widget()->do_layout();
-    auto new_rect = Gfx::IntRect({}, m_applet_area_size).centered_within(m_applet_area_container->screen_relative_rect());
-    GUI::ConnectionToWindowManagerServer::the().async_set_applet_area_position(new_rect.location());
+    // The tray is a child widget now, so the only thing left to do is re-run
+    // the (normally lazy) layout after something changed its width. There is
+    // no second window whose coordinates would have to be kept in sync.
+    if (main_widget())
+        main_widget()->do_layout();
 }
 
 NonnullRefPtr<GUI::Button> TaskbarWindow::create_button(WindowIdentifier const& identifier)
@@ -454,6 +424,13 @@ void TaskbarWindow::wm_event(GUI::WMEvent& event)
                 remove_window_button(*window, false);
             break;
         }
+        // Tool windows opt out of the taskbar (a player's playlist / lyrics /
+        // equalizer panels): one button per application, like the original.
+        if (GUI::ConnectionToWindowServer::the().get_window_skip_taskbar(changed_event.client_id(), changed_event.window_id())) {
+            if (auto* window = WindowList::the().window(identifier))
+                remove_window_button(*window, false);
+            break;
+        }
         auto& window = WindowList::the().ensure_window(identifier);
         window.set_title(changed_event.title());
         window.set_rect(changed_event.rect());
@@ -467,9 +444,9 @@ void TaskbarWindow::wm_event(GUI::WMEvent& event)
         break;
     }
     case GUI::Event::WM_AppletAreaSizeChanged: {
-        auto& changed_event = static_cast<GUI::WMAppletAreaSizeChangedEvent&>(event);
-        m_applet_area_size = changed_event.size();
-        m_applet_area_container->set_fixed_size(changed_event.size().width() + 8, 22);
+        // Legacy WM notification from the (now unused) native applet area.
+        // The child-widget tray sizes itself, so just re-run the layout.
+        m_wm_ready = true;
         update_applet_area();
         break;
     }

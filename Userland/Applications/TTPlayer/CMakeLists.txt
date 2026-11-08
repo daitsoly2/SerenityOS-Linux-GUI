@@ -17,6 +17,8 @@ set(SOURCES
     PlaylistStore.cpp
     PlaylistWindow.cpp
     SkinButton.cpp
+    SkinCanvas.cpp
+    SkinDocument.cpp
     SkinPanel.cpp
     SkinText.cpp
     SkinTheme.cpp

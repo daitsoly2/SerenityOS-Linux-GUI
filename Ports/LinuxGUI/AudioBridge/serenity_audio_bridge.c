@@ -63,29 +63,40 @@ static int open_device(void)
 
 static int open_pcm(snd_pcm_t **pcm, unsigned int rate)
 {
-	int error = snd_pcm_open(pcm, "default", SND_PCM_STREAM_PLAYBACK, 0);
+	/* "default" goes through PipeWire on a desktop session. The Serenity
+	 * session user has no PipeWire instance of its own, so fall back to the
+	 * hardware device directly (that user is in the audio group). */
+	static char const *candidates[] = { "default", "hw:0,0", "plughw:0,0" };
+	size_t i;
 
-	if (error < 0) {
-		fprintf(stderr, "audio-bridge: cannot open ALSA default: %s\n",
-			snd_strerror(error));
-		return -1;
+	for (i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+		int error = snd_pcm_open(pcm, candidates[i], SND_PCM_STREAM_PLAYBACK, 0);
+
+		if (error < 0) {
+			fprintf(stderr, "audio-bridge: cannot open ALSA %s: %s\n",
+				candidates[i], snd_strerror(error));
+			*pcm = NULL;
+			continue;
+		}
+
+		/* 200ms of latency: enough headroom for a VM without adding echo. */
+		error = snd_pcm_set_params(*pcm, SND_PCM_FORMAT_S16_LE,
+					   SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1,
+					   200000);
+		if (error < 0) {
+			fprintf(stderr, "audio-bridge: cannot configure %s: %s\n",
+				candidates[i], snd_strerror(error));
+			snd_pcm_close(*pcm);
+			*pcm = NULL;
+			continue;
+		}
+
+		printf("audio-bridge: playing %u Hz S16_LE stereo on %s\n", rate, candidates[i]);
+		fflush(stdout);
+		return 0;
 	}
 
-	/* 200ms of latency: enough headroom for a VM without adding echo. */
-	error = snd_pcm_set_params(*pcm, SND_PCM_FORMAT_S16_LE,
-				   SND_PCM_ACCESS_RW_INTERLEAVED, 2, rate, 1,
-				   200000);
-	if (error < 0) {
-		fprintf(stderr, "audio-bridge: cannot configure ALSA: %s\n",
-			snd_strerror(error));
-		snd_pcm_close(*pcm);
-		*pcm = NULL;
-		return -1;
-	}
-
-	printf("audio-bridge: playing %u Hz S16_LE stereo\n", rate);
-	fflush(stdout);
-	return 0;
+	return -1;
 }
 
 int main(int argc, char **argv)
@@ -109,8 +120,12 @@ int main(int argc, char **argv)
 	}
 
 	rate = device_rate(fd);
-	if (open_pcm(&pcm, rate) < 0)
+	if (open_pcm(&pcm, rate) < 0) {
+		/* Do not tight-loop through systemd's restart: the card can be held
+		 * by PipeWire from another session for a while. */
+		sleep(5);
 		return 1;
+	}
 
 	while (!s_quit) {
 		ssize_t got;

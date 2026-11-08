@@ -61,6 +61,8 @@ private:
 
     RefPtr<GUI::Menu> m_system_menu;
     RefPtr<GUI::Widget> m_task_button_container;
+    RefPtr<GUI::Widget> m_tray_widget;
+    bool m_wm_ready { false };
     RefPtr<Gfx::Bitmap const> m_default_icon;
     RefPtr<Gfx::Bitmap const> m_volume_icon;
     RefPtr<Gfx::Bitmap const> m_show_desktop_icon;

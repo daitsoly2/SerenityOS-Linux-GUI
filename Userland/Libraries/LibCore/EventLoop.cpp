@@ -186,6 +186,15 @@ void EventLoop::deferred_invoke(Function<void()> invokee)
 
 void deferred_invoke(Function<void()> invokee)
 {
+    // The loop stack is unwound while a process shuts down, but a timer, a
+    // socket notifier or another deferred callback can still fire in that
+    // window. Queuing onto a loop that no longer exists indexed an empty
+    // Vector and aborted the process, which turned an ordinary session stop
+    // into a SIGABRT in WindowServer and in every app that was closing.
+    if (!EventLoop::is_running()) {
+        dbgln("deferred_invoke: no EventLoop present, dropping the callback");
+        return;
+    }
     EventLoop::current().deferred_invoke(move(invokee));
 }
 

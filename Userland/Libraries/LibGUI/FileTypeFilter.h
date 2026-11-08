@@ -30,7 +30,7 @@ struct FileTypeFilter {
 
     static FileTypeFilter image_files()
     {
-        return FileTypeFilter { "Image Files", Vector<ByteString> { "png", "gif", "bmp", "dip", "pam", "pbm", "pgm", "ppm", "ico", "iff", "jb2", "jbig2", "jp2", "jpeg", "jpf", "jpg", "jpx", "jxl", "dds", "qoi", "tif", "tiff", "webp", "tvg" } };
+        return FileTypeFilter { "Image Files", Vector<ByteString> { "png", "apng", "gif", "bmp", "dip", "pam", "pbm", "pgm", "ppm", "pnm", "ico", "iff", "lbm", "jb2", "jbig2", "dcm", "dicom", "jp2", "j2k", "j2c", "jpc", "jpeg", "jpe", "jfif", "jpf", "jpg", "jpx", "jxl", "dds", "qoi", "tga", "tif", "tiff", "webp", "tvg" } };
     }
 
     static FileTypeFilter video_files()

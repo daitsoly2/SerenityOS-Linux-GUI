@@ -9,7 +9,8 @@
 >
 > **用法**：本文件是唯一的「一页速览」索引。新会话先读这一份即可，细节再按文末「源文档索引」跳转到对应的 dated handoff。
 > **生成来源**：由 `HANDOFF.md`(11-01)、`QUICK_LAUNCH_HANDOFF.md`(11-01)、`HANDOFF_LINUX_APPS.md`(11-02)、`HANDOFF_WINAPPS.md`(11-03)、`HANDOFF_WAYLAND_WINE.md`(11-03) 及 `.workbuddy/memory/2026-11-03.md` 汇总。
-> **最后更新**：2026-11-05（20:2x，Vista 主题双态 VM 实测通过；文件管理器 Vista/Win7 化落地；
+> **最后更新**：2026-11-08（Ctrl+Space 开/关中文输入法在 `serenity-engine` 落地，协议级 28/28；详见 §1.4f）。
+> 另 11-05：Vista 主题双态 VM 实测通过；文件管理器 Vista/Win7 化落地；
 > 修复 KMS 双缓冲「左右扫过按钮消失」——单份帧内容 + 全量提交，代价实测 1.31 ms/帧；详见 `VISTA_THEME.md` §6.1）。
 
 ---
@@ -39,12 +40,14 @@
 | 任务栏快速启动栏 | ✅ 已完成 | §1.2 |
 | 系统监视器 Lite | ✅ 已完成 | §1.2 |
 | 输入法（fcitx5 addon + LibGUI 客户端 + GTK immodule + 设置界面） | ✅ 已完成（11-05 VM 实测：只 rime / 模糊音 / 9 候选 / 内联预编辑） | §1.4 |
+| **Ctrl+Space 开/关中文输入法（serenity-engine 直链 librime）** | ✅ 代码完成 + 协议级 28/28；⚠️ 待 VM/GUI 端到端实测 | §1.4f |
 | Wine 中文字体 | 🟡 可装字体，FontSubstitutes 未生效 | §2.3 |
 | Terminal 增强 + 尺寸/SIGCHLD 修复 | ✅ VM 验证通过 | §1.2 / §3 |
 | 退出链路（注销/关机/重启） | 🟡 代码就绪，待部署验证 | §1.6 |
 | 真机（物理机）安装 | 🟡 脚本就绪（`06-install-host.sh`），未执行 | §1.6 |
 | Windows 启动器（serenity-winapp 原生 C++） | ✅ 已部署；app→原版wine / game→umu-run | §1.5 |
 | Windows 程序管理器（WinAppsSettings） | ✅ 已部署 VM；运行时策略已定（§1.5） | §2.5 |
+| 打印管理（PrintSettings） | 🟡 已部署 VM（`serenity-print-settings`）：CUPS 队列/任务管理 + 属性对话框；属性页未点开实测，详见 §2 | §2 |
 | 剪贴板桥接（X↔Wayland） | 🟡 代码完成，未实测 | §2.3 |
 | 系统级剪贴板（桌面内复制粘贴） | ✅ 已运行（server+socket+history） | §1.3 |
 | 输入法 rime 激活 | ✅ 已完成（11-05 VM 实测） | §3 |
@@ -173,6 +176,85 @@
     `serenity-desktop.service` 恢复。
 - **待办**：VM 部署 + 截图验证；Win+E 快捷键；`filesystemaccess` 自研组件接入评估。
 
+### 1.4e 统一图标解析 + 文件类型图标全表（11-07）
+
+- **问题**：桌面 / 文件管理器 / 开始菜单 / 快速启动各自解析图标，都不认识 freedesktop 主题名、`.ico`
+  与 exe 内嵌图标 → Linux 应用和 `.exe` 全是灰方块；且 `/etc/FileIconProvider.ini` **在 VM 上根本不存在**，
+  所有非图片文件只能落到 `filetype-unknown`（白纸）。仓库里 `filetype-archive.png` / `filetype-asm.png`
+  也从未部署过。
+- **系统层统一**：`Ports/LinuxGUI/Common/AppIcons.h`（`PortIcons::resolve` / `for_shortcut` /
+  `from_executable`，PE 资源 + 签名扫描兜底，XDG 主题按尺寸打分）与 `Common/AppShortcut.h`
+  （`PortShortcuts`，`.af`/`.desktop` 归一 + 一次转换落盘缓存）已接管全部调用点；
+  `LibGUI/FileIconProvider.cpp` 的宿主分支让**所有** GUI 客户端自动受益。
+- **本轮新增（11-07）**：
+  1. **类型表 50 条**：`Base/etc/FileIconProvider.ini` 从 38 条扩到 50 个图标族、约 600 个模式
+     （源码 zig/rs/go/lua/nix、文档 doc/docx/odt/epub、数据 toml/yaml/conf/env、磁盘 iso/qcow2/vmdk、
+     包 deb/rpm/appimage、证书 pem/pfx、3D stl/glb/fbx、字体 woff2、归档 tar.*/7z/zst/lz4、媒体
+     ogg/opus/webp/avif……）。
+  2. **新增 12 个图标**（`scripts/gen-filetype-icons.py`，纯 Python 画：白纸 + 色标 + 5×7 像素字，
+     与已有 `filetype-asm` 同风格）：zig rust go config diskimage package document log lua
+     certificate nix model3d，各出 16×16 + 32×32。删掉了两个手滑写坏的模式行。
+  3. **配置路径宿主化**：`FileIconProvider` 现在优先读 `$SERENITY_PREFIX/etc/FileIconProvider.ini`
+     （备用 `/etc/`），且文件缺失不再 `VERIFY` 崩，只退化为 `filetype-unknown`。
+  4. **匹配顺序确定化**：原来遍历 `HashMap` 的 key，`x.tar.gz` 可能在两个进程里命中不同规则；
+     改为按 ini 声明顺序的 `Vector` 遍历，`*.tar.gz` 一定先于 `*.gz`。
+  5. **`for_shortcut` 第三级回退**：`.af` 忘写 `Icon=` 时（`_Image Viewer.af`、`_TTPlayer.af`）
+     按可执行文件 basename 反查 `<prefix>/res/icons/<size>/app-<kebab>.png`，失败再试 `app-<lowercase>`
+     （`TTPlayer` → `app-ttplayer.png`）。
+- **顺带修**：`wine`/`umu-run` 快捷方式**误判为损坏**（VM 没装 wine，但 `.lnk` 还在）→ 桌面给明日方舟
+  画了红叉。`ExplorerMenus.h::shortcut_status_for_record` 现在先解析 `WorkingDirectory` 上溯找到含
+  `drive_c` 的前缀根，把 `C:\...` 参数翻成宿主路径再判断；找不到前缀就**不报警**。
+  桌面从自己的重复实现改为调用同一函数。
+- **VM 实测（11-07 11:35–11:58）**：
+  - 桌面：`Launcher.exe` 出真实 PE 图标、`火狐浏览器 ESR` 出主题图标、`111.zip` 出归档图标、
+    `TTPlayer 音乐播放器`/`图像查看器` 出 app 图标；`明日方舟：终末地` **红叉消失**。
+  - 人为放一个 `Exec=/usr/bin/does-not-exist-xyz` 的 `.desktop` → 红叉 + 灰标签，删掉后恢复。
+  - `~/.local/share/serenity/shortcuts/*.af` 的 mtime 在重启前后**完全不变**（`stat` 全量 md5 比对）→
+    二次扫描确实只读缓存、不再解析 `.desktop`。
+  - 文件管理器 42 + 21 个样本文件逐格核对：全部命中预期图标，无一个落 `filetype-unknown`。
+  - 开始菜单 → Linux 应用：12 项，图标全在（htop/xterm/vim/gtk-demo 等已被过滤）。
+- **运维**：VM 新增 `/etc/systemd/system/serenity-desktop.service.d/pointer.conf`
+  （`SERENITY_POINTER_FLAT_ACCEL=1`）。**截图点击用 `vncshot.py "click:x,y"`（QMP 绝对坐标）即可**，
+  比 `poke` 稳；`set-environment` 对 unit 无效（unit 自带的 `Environment=` 不继承 manager 环境）。
+
+### 1.4f Ctrl+Space 开/关中文输入法（11-08，代码完成 + 协议级 28/28，待 VM 实测）
+
+- **架构现状（与旧 HANDOFF 里的 fcitx5 addon 链路不同）**：`SessionManager/serenity_manager.cpp`
+  的 `ime` child 已指向 `/serenity/bin/serenity-engine`，引擎源码
+  `Ports/LinuxGUI/IMEEngine/serenity-engine.cpp` **直链 librime** —— 不再有 fcitx5、不再有
+  `serenity-ime` 透明代理。三条前端（原生 `LibGUI::InputMethod`、`WlrootsHost/ImeService.cpp`
+  + `main.cpp`、`XimServer.cpp`）都把 `key <keysym> <states> <release>` 行发到
+  `/tmp/serenity-ime.sock`，由引擎统一处理。
+- **决策：开关放引擎服务端，不改任何前端**。原实现没有 on/off 状态，`key` 直接进
+  `rime->process_key()`，Ctrl+Space 只被当普通空格。一处拦截三条前端通吃，也不必给
+  LibGUI / 桥 / XIM 各写一遍状态同步。
+- **行为**：press 命中 `keysym==0x20 && Ctrl(1<<2) && 无 Alt/Mod3/Super/AltGr` → 翻转全局
+  `g_active` 并吞键；配套 release 按 keysym 查 `last_press_handled` 也吞（keyup 时 Ctrl 已
+  松开也不会漏半个空格给编辑器）。关闭期间所有按键直接回 `handled 0`，**完全不进 rime**
+  ＝英文直输。状态是**全局**而非 per-client（Windows/fcitx 语义，切窗口保持英文）。
+  切换瞬间对所有 client `clear_composition()` + 推空 `panel`，擦掉残留拼音与候选窗。
+- **托盘 / 设置界面兼容**：写 `$SERENITY_IME_STATUS_DIR/serenity-ime-status`
+  （`<active>\t<unique_name>\t<display_name>`，与旧 addon 同格式）和 `serenity-ime-methods`
+  （`rime` / `keyboard-us`）；ctl socket 支持 `status` / `set rime|keyboard-us` /
+  `toggle [on|off]`。引擎启动时 `initial_active()` 读状态文件恢复上次开关，
+  `serenitid` 重启不会把用户刚关掉的输入法变回中文。
+- **验证**：新增 `scripts/port/ime-toggle-test.py`，用私有 socket + 私有 `RIME_USER_DATA_DIR`
+  启动真引擎跑 28 项行协议断言（开关 / 英文放行 / release 吞键 / Ctrl+Alt+Space 不触发 /
+  ctl 同步 / 重启保持）。stub 引擎与**真 librime** 均 `28 passed, 0 failed`。
+  生产二进制 `Build/lagom/bin/serenity-engine` 已用真 `/usr/include/rime_api.h` +
+  `/usr/lib/x86_64-linux-gnu/librime.so` 手工编译链接（`ldd` 确认 `librime.so.1`）。
+- ⚠️ **构建坑（与本次代码无关）**：`ninja -C Build/lagom serenity-engine` 会触发 CMake
+  重配并因 `Ports/LinuxGUI/CMakeLists.txt:33` 硬要求 `sdl2` pkg-config 失败。绕法：取
+  `Build/lagom/compile_commands.json` 里展开的 clang++ 命令编 `.o`，再按 `build.ninja`
+  的 `bin/serenity-engine` link edge 手工链接 `librime.so`。
+- ⚠️ **宿主限制（不影响 VM）**：真 librime 在宿主容器里 `start_maintenance(True)` 阶段
+  SIGBUS（rc=135；`/usr/share/rime-data` 完整、`RimeApi data_size=788` ABI 匹配，诊断副本
+  打印停在 `DIAG: before maintenance`）。协议回归用的是**跳过 maintenance 的测试副本**；
+  生产源码保留该调用（首次启动必须重建 `luna_pinyin.table.bin`）。需在 VM 上确认首次部署
+  能正常起引擎。
+- **待办**：部署到 VM 后在 notepad / gedit / XIM 路径做 Ctrl+Space 端到端实测（托盘
+  「中 / EN」是否同步、关闭后是否真英文直输、候选窗是否擦干净）。
+
 ### 1.5 Windows 运行时策略 + 原生启动器（11-03）
 - **决策（用户拍板：移植为原生）**：`serenity-winapp` 由 sh 脚本改为**原生 C++ 二进制**，策略内置于代码，对齐 omikuji 的 `assemble_launch + WineVariant`（omikuji 核心启动是 Rust 原生 argv + `Command::new().spawn()`，`sh -c` 只用于 pre/post hook）。
   - 源码 `Ports/LinuxGUI/WinAppLauncher/main.cpp`；目标 `serenity-winapp`（无 Serenity 库，纯 POSIX `execvp`）。
@@ -211,6 +293,7 @@
   - **已修（11-03）**：`wine reg import` 会静默丢弃中文键名，导致 FontSubstitutes 不生效。改为 `wine reg add` **逐条写**（Fonts / FontSubstitutes / FontLink 每个值单独 reg add）。VM 实测：新前缀跑 `serenity-wine-fonts` 后 `wine reg query ...\FontSubstitutes /v 宋体` 命中 → `Sarasa Gothic SC`，`/v 微软雅黑` 同；`SimSun`/`Microsoft YaHei` 亦对（共 38 个 REG_SZ）。FontLink 的 `REG_MULTI_SZ` 为 best-effort。字体名解析链已闭合，中文 exe 应不再出方框（尚未用真实中文 exe 目测）。
 - **剪贴板桥接（X↔Wayland）**：`wl_data_device_manager v3` 代码已实现（source/offer/device + set_selection 广播 + receive→send_data fd 转发，参照 weston）。**未实测**（X 应用复制 → GTK 原生粘贴）。
 - **滚轮 / 悬停手测**：pointer_axis 已按客户端路由、悬停链路 GTK 已确认，但 Firefox/xterm 滚动、xterm 真实输入回归（VNC 注入点击 xterm→打字→回显）**只做过代码走查或做到一半**。
+- **打印管理（PrintSettings，2026-11-07）**：系统原本完全没有打印功能（源码 0 处打印机相关、VM 未装 CUPS；CUPS 现由用户 `apt install cups` 补上）。新增 `Userland/Applications/PrintSettings/`（宿主目标 `serenity-print-settings`，`/bin/PrintSettings` → 开始菜单/控制面板「打印机和其它硬件 → 管理打印机和打印任务」）：打印机列表（名称/状态/设备/位置/默认●，3 秒自动刷新）、任务列表（`lpstat -W not-completed -o`，可取消）、添加打印机（`lpinfo` 发现 + `-m everywhere/raw/驱动列表`）、删除、设为默认（`lpadmin -d`）、启用/禁用（`cupsenable/disable`）、接受/拒绝任务（`cupsaccept/cupsreject`）、打印测试页（`lp -d … /usr/share/cups/data/testprint`）。**打印机属性对话框**（双击前的「属性…」按钮）：三个页——常规（名称/驱动 Make-and-Model/说明 -D/位置 -L/设备 URI -v/共享 printer-is-shared）、默认选项（`lpoptions -l` 动态生成每项下拉 + `lpadmin -o KEY=CHOICE` 写队列默认）、高级（接受任务、启用、错误处理 printer-error-policy：retry-job/abort-job/stop-printer、每用户配额 job-quota-period/job-page-limit/job-k-limit）。读取：`lpstat -l -v -d`、`lpoptions -l`、`ipptool -X`（解析 plist XML，**printers.conf 不可用**——`-o` 改动后 cupsd 不写回，已实测）。特权模型：读命令免权限；管理命令首试直连（VM 装 CUPS 后 serenity 用户已加入 lpadmin 组），失败回退 `sudo -n`。VM 实测通过：两队列（raw socket 9100/9、Generic PCL PPD 队列）列表/状态/测试页上报/lpadmin -o 往返（error-policy、quotas、shared、A4 默认选项均以 IPP 复核生效）。**未实测**：属性对话框从未真正打开过（VM 桌面一直被用户/并行部署会话以 `systemctl restart serenity-desktop` 反复重启，QMP 注入点击屡屡落到会话空窗；且当前同时有另一路部署在装 liblagom-gui/shell/图标），**需要在稳定会话里点开「属性…」手测一遍**（尤其：apply 后刷新、选项应用、配额写入、错误提示路径）。遗留：VM 里留了两台测试队列 `serenitytest`（raw→127.0.0.1:9）与 `opttest`（PCL PPD，drv-backed），用于演示状态；用完可在 app 里直接删除。**没有**给 app 加双击打开属性、**没有**接「打印到文件/PDF」虚拟打印机（cups-pdf 不在 trixie 的本地镜像里；如需可再做 print-to-file 后端）。端口提示：并行部署会话 11:48/11:50/11:54 连续三次 `systemctl stop/restart serenity-desktop.service` + 覆盖 liblagom-gui/liblagom-desktop/serenity-shell/serenity-file-manager —— 本产物只覆盖 serenity-print-settings/serenity-settings，不冲突。
 - **Settings 改造为 Win9x 控制面板**：`Userland/Applications/Settings/main.cpp` 改 GroupBox + IconView，本机构建通过，**未部署 VM 验证**；已知缺口 Display 项（DisplaySettings 依赖未移植的 LibEDID，点了失败）、Browser/Mail/Maps Settings 依赖 LibWeb 同样点开失败。
 - **Windows 程序管理器（WinAppsSettings，11-03）**：`serenity-win-apps-settings` 已部署 VM（`/serenity/bin/` 在位）；启动器已原生化为 `serenity-winapp`（见 §1.5）。**「设置里点不开」已修（两层）**：①`GUI::Icon::default_icon("app-brickgame").bitmap_for_size(16)` 返回的指针归临时 `Icon` 所有，析构后 `Window::set_icon(悬垂指针)` 触发 `VERIFICATION FAILED` → 先存 `auto app_icon = default_icon(...)`；②真正的启动段错误：`GUI::ItemListModel` 存的是 `Container const&`（**引用**），而 combo 的模型是用临时 `Vector<ByteString>{...}` 建的 → 悬垂引用，`set_text("auto")` 读模型时 SIGSEGV → 把该 vector 提成具名局部变量。VM 截图确认「Windows 程序管理」窗口正常出现。**注意 ItemListModel 存引用**：其它地方传的必须是活得够久的 vector（成员/static/局部且组件同域）；已查 `g_types`/`s_*`/`m_*`/`static` 都安全，Spreadsheet 导入导出的局部 vector 未构建暂未处理。待办 = 端到端 UI 清单（面板可见、装 exe 生成 wrapper/桌面.desktop/开始菜单.af、开始菜单「游戏」子菜单合并、双击在独立 prefix 跑、卸载清三样产物）。P2 复核点：桌面目录一致性、`remove_artifacts` 删不掉时无提示、注册表并发。**UI 重做（11-03）**：改为 TableView 三列（名称/模式/程序文件）、底部状态栏、选中才启用 启动/运行环境/卸载、双击启动、模式下拉中文化、安装流程加「命名 + 是否立即运行」、加「刷新」。**「Label 不显示」实为根 widget 未填背景**（补 `set_fill_with_background_color(true)` 后 exe 路径 Label 正常显示，详见 §三）。
 - **GTK 补丁系列**：目录与管线已就位（`Ports/gtk-serenity/`），patch 本体待写；GTK4 4.24.1 源码包 `dpkg-source` 解包失败（当前补丁对 4.18.6）。

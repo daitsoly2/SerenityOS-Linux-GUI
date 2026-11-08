@@ -18,15 +18,257 @@
 #include "ExplorerEntries.h"
 #include <AK/ByteString.h>
 #include <AK/Function.h>
+#include <AK/LexicalPath.h>
 #include <AK/HashMap.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/RefCounted.h>
 #include <AK/String.h>
+#include "hostify.h"
+#include "AppShortcut.h"
+#include <LibCore/Process.h>
+#include <LibCore/StandardPaths.h>
+#include <LibDesktop/Launcher.h>
+#include <LibFileSystem/FileSystem.h>
 #include <LibGUI/Action.h>
+#include <LibGUI/Dialog.h>
 #include <LibGUI/Menu.h>
+#include <LibGUI/MessageBox.h>
+#include <LibGUI/Window.h>
 #include <LibGfx/Bitmap.h>
+#include <LibURL/URL.h>
+#include <unistd.h>
 
 namespace ExplorerShared {
+
+// ---------------------------------------------------------------------------
+// Broken shortcuts
+//
+// A shortcut can outlive its program (uninstalled app, deleted .exe) or be a
+// truncated / hand-edited .af that no longer parses. Both the desktop and the
+// file manager double-click such a file and get nothing. Detect that here and
+// offer to remove it instead. System-owned launchers are never deleted.
+
+enum class ShortcutStatus {
+    NotAShortcut,
+    OK,
+    Broken,
+};
+
+// Wine / Proton launchers are a special case: the shortcut's real target is the
+// .lnk (or .exe) in the arguments, while the wrapper binary may only exist
+// inside the winapp sandbox. Checking `wine` alone paints a red cross over a
+// perfectly usable game shortcut.
+inline bool is_windows_launcher(ByteString const& program)
+{
+    auto name = LexicalPath::basename(program);
+    static constexpr StringView wrappers[] = {
+        "wine"sv, "wine64"sv, "wine-preloader"sv, "wine64-preloader"sv,
+        "umu-run"sv, "proton"sv, "serenity-winapp"sv,
+    };
+    for (auto wrapper : wrappers) {
+        if (name == wrapper)
+            return true;
+    }
+    return false;
+}
+
+// Walk up from WorkingDirectory until a directory that actually contains a
+// wine prefix (drive_c) is found.
+inline Optional<ByteString> wine_prefix_root(PortShortcuts::Record const& record)
+{
+    auto directory = record.working_directory;
+    while (!directory.is_empty() && directory != "/"sv) {
+        if (FileSystem::exists(ByteString::formatted("{}/drive_c", directory)))
+            return directory;
+        auto parent = LexicalPath::dirname(directory);
+        if (parent == directory)
+            break;
+        directory = parent;
+    }
+    return {};
+}
+
+// C:\users\Public\Desktop\game.lnk -> <prefix>/drive_c/users/Public/Desktop/game.lnk
+inline ByteString windows_argument_to_host(ByteString const& prefix_root, ByteString argument)
+{
+    argument = argument.replace("\\\\"sv, "/"sv);
+    argument = argument.replace("\\"sv, "/"sv);
+    while (argument.contains("//"sv))
+        argument = argument.replace("//"sv, "/"sv);
+    if (argument.length() >= 2 && argument.characters()[1] == ':')
+        argument = argument.substring(2);
+    if (!argument.starts_with("/"sv))
+        argument = ByteString::formatted("/{}", argument);
+
+    auto candidate = ByteString::formatted("{}/drive_c{}", prefix_root, argument);
+    return FileSystem::exists(candidate) ? candidate : ByteString {};
+}
+
+// Checks a shortcut that is already parsed, so callers that just ran
+// PortShortcuts::scan do not have to read the file a second time.
+inline ShortcutStatus shortcut_status_for_record(PortShortcuts::Record const& record)
+{
+    auto resolved = PortHostify::resolve_executable(record.program);
+    if (access(resolved.characters(), X_OK) == 0)
+        return ShortcutStatus::OK;
+    // A wrapper script or a Windows binary behind a launcher is still valid
+    // as long as it exists, even if it lost its executable bit.
+    if (FileSystem::exists(resolved))
+        return ShortcutStatus::OK;
+
+    if (is_windows_launcher(record.program)) {
+        // Without a prefix we cannot tell what the shortcut points at - stay
+        // quiet instead of offering to delete a launcher that may still work.
+        auto root = wine_prefix_root(record);
+        if (!root.has_value())
+            return ShortcutStatus::OK;
+        for (auto const& argument : record.arguments) {
+            if (!windows_argument_to_host(root.value(), argument).is_empty())
+                return ShortcutStatus::OK;
+        }
+    }
+    return ShortcutStatus::Broken;
+}
+
+inline ShortcutStatus shortcut_status(StringView path)
+{
+    if (!PortShortcuts::is_shortcut_or_executable(path))
+        return ShortcutStatus::NotAShortcut;
+    ByteString value { path };
+    if (PortIcons::is_windows_executable(path))
+        return FileSystem::exists(path) ? ShortcutStatus::OK : ShortcutStatus::Broken;
+
+    auto record = PortShortcuts::parse(path);
+    if (!record.has_value())
+        return ShortcutStatus::Broken; // unreadable / truncated shortcut file
+    return shortcut_status_for_record(*record);
+}
+
+inline bool is_user_owned(StringView path)
+{
+    auto home = Core::StandardPaths::home_directory();
+    if (home.is_empty() || !path.starts_with(home))
+        return false;
+    for (auto prefix : { "/usr/"sv, "/etc/"sv, "/res/"sv }) {
+        if (path.starts_with(prefix))
+            return false;
+    }
+    return true;
+}
+
+// Returns true when the path was a broken shortcut and the user was prompted
+// (callers should stop their normal open path in that case).
+inline bool offer_delete_broken_shortcut(GUI::Window* window, StringView path)
+{
+    if (shortcut_status(path) != ShortcutStatus::Broken)
+        return false;
+    ByteString value { path };
+    auto label = LexicalPath::basename(path);
+
+    if (!is_user_owned(path)) {
+        GUI::MessageBox::show(window,
+            ByteString::formatted("快捷方式“{}”指向的程序已不存在，但它由系统管理，无法删除。", label),
+            "无效的快捷方式"sv, GUI::MessageBox::Type::Warning);
+        return true;
+    }
+
+    auto answer = GUI::MessageBox::show(window,
+        ByteString::formatted("快捷方式“{}”无法打开（文件损坏或指向的程序已被删除）。\n是否删除这个快捷方式？", label),
+        "无效的快捷方式"sv, GUI::MessageBox::Type::Warning,
+        GUI::MessageBox::InputType::YesNo);
+    if (answer != GUI::Dialog::ExecResult::Yes)
+        return true;
+
+    if (auto result = FileSystem::remove(value, FileSystem::RecursionMode::Disallowed); result.is_error()) {
+        GUI::MessageBox::show(window,
+            ByteString::formatted("无法删除 {}：{}", value, result.error()),
+            "删除快捷方式"sv, GUI::MessageBox::Type::Error);
+        return true;
+    }
+    // Also drop the converted .af cache so a stale entry cannot resurrect it.
+    if (value.ends_with(".desktop"sv)) {
+        auto cached = PortShortcuts::cache_path_for(path);
+        if (!cached.is_empty() && FileSystem::exists(cached))
+            (void)FileSystem::remove(cached, FileSystem::RecursionMode::Disallowed);
+    }
+    return true;
+}
+
+// "打开方式" body shared by the desktop and the file manager.
+//
+// Both used to build this list themselves: the desktop iterated the whole app
+// catalog (offering a game for a .zip), the file manager used the MIME
+// handler database. One implementation now asks the launcher database, and
+// the caller may append catalog entries when nothing is registered.
+struct OpenWithApp {
+    ByteString name;
+    ByteString executable;
+};
+
+inline Vector<OpenWithApp> registered_open_with_apps(ByteString const& path)
+{
+    Vector<OpenWithApp> apps;
+    if (path.is_empty())
+        return apps;
+
+    auto url = URL::create_with_file_scheme(path);
+    for (auto const& details : Desktop::Launcher::get_handlers_with_details_for_url(url)) {
+        if (details->executable.is_empty())
+            continue;
+        OpenWithApp app;
+        app.name = details->name.is_empty() ? details->executable : details->name;
+        app.executable = details->executable;
+        apps.append(move(app));
+    }
+    return apps;
+}
+
+inline void launch_open_with(ByteString const& executable, ByteString const& path)
+{
+    if (executable.is_empty() || path.is_empty())
+        return;
+    auto host_executable = PortHostify::resolve_executable(executable);
+    Array<ByteString, 1> arguments { path };
+    if (auto result = Core::Process::spawn(host_executable.view(),
+            ReadonlySpan<ByteString> { arguments.data(), arguments.size() },
+            LexicalPath::dirname(path));
+        result.is_error())
+        warnln("explorer: open-with {} failed: {}", host_executable, result.error());
+}
+
+// Adds the actions; a disabled placeholder is better than an empty submenu,
+// which shows an arrow that opens nothing.
+inline void fill_open_with_menu(GUI::Menu& menu, Vector<OpenWithApp> const& apps, ByteString const& path)
+{
+    if (apps.is_empty()) {
+        auto placeholder = GUI::Action::create("（没有可用的程序）"sv, [](auto&) {});
+        placeholder->set_enabled(false);
+        menu.add_action(move(placeholder));
+        return;
+    }
+    for (auto const& app : apps) {
+        menu.add_action(GUI::Action::create(app.name, [app, path](auto&) {
+            launch_open_with(app.executable, path);
+        }));
+    }
+}
+
+// "属性" shared by both sides: the file manager binary owns the real dialog
+// (size, permissions, type-specific tabs), so ask it for a single window
+// instead of opening the system Settings app.
+inline void show_file_properties(ByteString const& path)
+{
+    if (path.is_empty())
+        return;
+    auto executable = PortHostify::resolve_executable("serenity-file-manager"sv);
+    Array<ByteString, 2> arguments { ByteString { "--properties" }, path };
+    if (auto result = Core::Process::spawn(executable.view(),
+            ReadonlySpan<ByteString> { arguments.data(), arguments.size() },
+            LexicalPath::dirname(path));
+        result.is_error())
+        warnln("explorer: properties {} failed: {}", path, result.error());
+}
+
 
 inline RefPtr<Gfx::Bitmap const> menu_icon(StringView name)
 {

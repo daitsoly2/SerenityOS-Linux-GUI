@@ -19,6 +19,8 @@
 #include <LibGUI/ResizeDirection.h>
 #include <LibGUI/WindowMode.h>
 #include <LibGUI/WindowType.h>
+#include <AK/Optional.h>
+#include <LibGfx/Color.h>
 #include <LibGfx/Forward.h>
 #include <LibGfx/Rect.h>
 #include <LibGfx/StandardCursor.h>
@@ -78,6 +80,16 @@ public:
 
     void set_alpha_hit_threshold(float);
     float alpha_hit_threshold() const { return m_alpha_hit_threshold; }
+
+    // Declare one opaque RGB value as transparent (bitmap-skin colour key).
+    // WindowServer filters it during compositing and makes those pixels
+    // click-through; {} disables it.
+    void set_transparent_color(Optional<Gfx::Color> const&);
+    Optional<Gfx::Color> transparent_color() const;
+
+    // Tool windows (a player's playlist / lyrics / equalizer panels) stay out
+    // of the taskbar: one button per application, like the original player.
+    void set_skip_taskbar(bool);
 
     WindowType window_type() const { return m_window_type; }
     void set_window_type(WindowType);

@@ -238,8 +238,14 @@ void Compositor::compose()
         if (affected_transparency_rects.is_empty())
             return IterationDecision::Continue;
         // If we have transparency rects that affect others, we better have transparency rects ourselves...
+        // ...but do not abort the whole compositor when that invariant slips:
+        // a colour-keyed window whose content became fully transparent reports
+        // no transparency rects of its own while the bookkeeping still lists
+        // affected ones. Skipping the pass is harmless; crashing takes the
+        // entire desktop down with it.
         auto& transparency_rects = window.transparency_rects();
-        VERIFY(!transparency_rects.is_empty());
+        if (transparency_rects.is_empty())
+            return IterationDecision::Continue;
         for (auto& it : affected_transparency_rects) {
             auto& affected_window_dirty_rects = it.key->dirty_rects();
             auto& affected_rects = it.value;
@@ -761,7 +767,13 @@ void Compositor::render_window(Gfx::Painter& painter, Window& window, Screen& sc
         return;
 
     auto clear_window_rect = [&](Gfx::IntRect const& clear_rect) {
-        painter.fill_rect(clear_rect, wm.palette().window());
+        // Transparent windows must not be padded with an opaque theme colour:
+        // the area outside the backing store (resize gap, or no backing at all)
+        // has to stay see-through so a shaped window keeps its silhouette.
+        if (window.has_alpha_channel() || window.transparent_color().has_value())
+            painter.clear_rect(clear_rect, Gfx::Color::Transparent);
+        else
+            painter.fill_rect(clear_rect, wm.palette().window());
     };
 
     RefPtr<Gfx::Bitmap> backing_store = window.backing_store();
@@ -815,6 +827,19 @@ void Compositor::render_window(Gfx::Painter& painter, Window& window, Screen& sc
         if (window.client() && window.client()->is_unresponsive()) {
             painter.blit_filtered(dst, *backing_store, dirty_rect_in_backing_coordinates, [](Color src) {
                 return src.to_grayscale().darkened(0.75f);
+            });
+        } else if (window.transparent_color().has_value()) {
+            // Colour-key transparency: the skin bitmap marks holes with one
+            // opaque RGB (M4Player's transparent_color). Filter those pixels
+            // to fully transparent instead of blitting them.
+            // NOTE: blit_filtered() leaves alpha=0 results untouched in the
+            // destination, which is exactly what we want here - on the
+            // framebuffer path the desktop is already painted underneath, so
+            // skipped key pixels show the wallpaper. Do NOT clear_rect() the
+            // dirty target first: the destination is opaque RGB and writing
+            // zero there turns the holes black instead of see-through.
+            painter.blit_filtered(dst, *backing_store, dirty_rect_in_backing_coordinates, [&window](Color src) {
+                return window.matches_transparent_color(src) ? Gfx::Color::Transparent : src;
             });
         } else {
             painter.blit(dst, *backing_store, dirty_rect_in_backing_coordinates);
@@ -886,7 +911,14 @@ void Compositor::flush(Screen& screen)
     }
 
     auto do_flush = [&](Gfx::IntRect rect) {
-        VERIFY(screen_rect.contains(rect));
+        // A window dragged partly off-screen (or resized past the edge) puts
+        // dirty rects outside the screen. Aborting the compositor over that
+        // is never the right answer - clip instead.
+        if (!screen_rect.contains(rect)) {
+            rect.intersect(screen_rect);
+            if (rect.is_empty())
+                return;
+        }
         rect.translate_by(-screen_rect.location());
 
         // Almost everything in Compositor is in logical coordinates, with the painters having

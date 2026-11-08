@@ -13,6 +13,11 @@
 // and paints an icon whose look follows the level.
 
 #include <AK/Vector.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/file.h>
+#include <unistd.h>
 #include <LibCore/ArgsParser.h>
 #include <LibCore/ConfigFile.h>
 #include <LibCore/Directory.h>
@@ -20,6 +25,7 @@
 #include <LibGfx/Font/FontDatabase.h>
 #include <LibGUI/Painter.h>
 #include <LibGUI/Application.h>
+#include <LibGUI/Button.h>
 #include <LibGUI/Event.h>
 #include <LibGUI/Frame.h>
 #include <LibGUI/Slider.h>
@@ -132,15 +138,50 @@ private:
     {
         // Win9x 风格：下沉面板 + 竖滑块 + 百分比。用普通窗口（带关闭按钮），
         // 因为 Popup/无边框窗口在这套 WindowServer 里没有定位和关闭的入口。
+        // 但它是从托盘弹出的临时面板，不是应用主窗口：不占任务栏按钮。
         set_title(GUI::translate_ui("Volume"_string).to_byte_string());
+        set_skip_taskbar(true);
+        // A transient tray flyout needs no title bar: it is not a taskbar
+        // window, it is positioned by --position, and it closes by clicking
+        // the tray button again, the x, or anywhere else.
+        set_frameless(true);
         set_resizable(false);
         resize(96, 240);
 
         auto widget = GUI::Frame::construct();
-        widget->set_frame_style(Gfx::FrameStyle::SunkenPanel);
+        // No window frame at all: this is a transient flyout, not a dialog.
+        // A plain flat panel plus the palette background is enough to separate
+        // it from the desktop; the 3D sunken border made it look like another
+        // application window.
+        widget->set_frame_style(Gfx::FrameStyle::NoFrame);
         widget->set_fill_with_background_color(true);
         set_main_widget(widget);
         widget->set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 8, 8, 8, 8 }, 4);
+
+        auto& header = widget->add<GUI::Widget>();
+        header.set_layout<GUI::HorizontalBoxLayout>(GUI::Margins {}, 2);
+        header.set_fixed_height(16);
+        auto& caption = header.add<GUI::Label>();
+        caption.set_text("音量"_string);
+        auto& close_button = header.add<GUI::Button>();
+        close_button.set_text("x"_string);
+        close_button.set_button_style(Gfx::ButtonStyle::Coolbar);
+        close_button.set_fixed_size(18, 16);
+        close_button.set_tooltip("关闭"_string);
+        close_button.on_click = [this](unsigned) { close(); };
+
+        // Losing focus (a click anywhere else) closes the flyout. Only react
+        // after we have actually been active, so the initial inactive state
+        // does not close the window before it is shown.
+        bool was_active = false;
+        on_active_window_change = [this, was_active](bool active) mutable {
+            if (active) {
+                was_active = true;
+                return;
+            }
+            if (was_active)
+                close();
+        };
 
         auto& slider = widget->add<GUI::Slider>();
         slider.set_orientation(Orientation::Vertical);
@@ -178,6 +219,31 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
     auto level = read_volume();
 
     if (open_window) {
+        // One popup at a time. Clicking the tray button while the panel is
+        // already open closes it instead of spawning a second process (and a
+        // second window / taskbar button on every click).
+        constexpr char const* lock_path = "/tmp/.serenity-volume-popup.lock";
+        int lock_fd = open(lock_path, O_CREAT | O_RDWR, 0600);
+        if (lock_fd < 0 || flock(lock_fd, LOCK_EX | LOCK_NB) != 0) {
+            char pid_text[32] {};
+            if (lock_fd >= 0) {
+                lseek(lock_fd, 0, SEEK_SET);
+                (void)!read(lock_fd, pid_text, sizeof(pid_text) - 1);
+            }
+            int existing_pid = atoi(pid_text);
+            if (existing_pid > 1)
+                kill(existing_pid, SIGTERM);
+            if (lock_fd >= 0)
+                close(lock_fd);
+            return 0;
+        }
+        // Keep lock_fd open: the kernel drops the flock when this process dies,
+        // which is exactly when the panel is closed.
+        ftruncate(lock_fd, 0);
+        char pid_text[32] {};
+        int length = snprintf(pid_text, sizeof(pid_text), "%d\n", getpid());
+        (void)!write(lock_fd, pid_text, static_cast<size_t>(length));
+
         auto window = VolumePopup::construct(level);
         if (!position_text.is_empty()) {
             auto parts = TRY(position_text.split(','));

@@ -5,6 +5,10 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/Base64.h>
+#include <AK/ByteString.h>
+#include <AK/JsonObject.h>
+#include <AK/Utf8View.h>
 #include <Clipboard/ClipboardClientEndpoint.h>
 #include <Clipboard/ClipboardServerEndpoint.h>
 #include <LibGUI/Clipboard.h>
@@ -142,12 +146,17 @@ RefPtr<Gfx::Bitmap> Clipboard::DataAndType::as_bitmap() const
 
 ErrorOr<Clipboard::DataAndType> Clipboard::DataAndType::from_json(JsonObject const& object)
 {
-    if (!object.has("data"sv) && !object.has("mime_type"sv))
+    if (!object.has("data"sv) && !object.has("data_base64"sv) && !object.has("mime_type"sv))
         return Error::from_string_literal("JsonObject does not contain necessary fields");
 
     DataAndType result;
-    result.data = object.get_byte_string("data"sv)->to_byte_buffer();
-    result.mime_type = *object.get_byte_string("mime_type"sv);
+    if (object.has("data_base64"sv)) {
+        // Binary payloads (e.g. image/x-serenityos bitmaps) are stored base64-encoded.
+        result.data = TRY(decode_base64(object.get_byte_string("data_base64"sv)->view()));
+    } else if (object.has("data"sv)) {
+        result.data = object.get_byte_string("data"sv)->to_byte_buffer();
+    }
+    result.mime_type = object.get_byte_string("mime_type"sv).value_or({});
 
     auto maybe_metadata_object = object.get_object("metadata"sv);
     if (maybe_metadata_object.has_value()) {
@@ -164,7 +173,14 @@ ErrorOr<Clipboard::DataAndType> Clipboard::DataAndType::from_json(JsonObject con
 ErrorOr<JsonObject> Clipboard::DataAndType::to_json() const
 {
     JsonObject object;
-    object.set("data", TRY(ByteString::from_utf8(data.bytes())));
+    if (Utf8View(data.bytes()).validate()) {
+        // Keep text payloads human-readable in the JSON history file.
+        object.set("data", TRY(ByteString::from_utf8(data.bytes())));
+    } else {
+        // Binary payloads (e.g. image/x-serenityos bitmaps) would fail UTF-8 validation,
+        // so store them base64-encoded under a separate key.
+        object.set("data_base64", TRY(encode_base64(data.bytes())).to_byte_string());
+    }
     object.set("mime_type", mime_type);
 
     if (!metadata.is_empty()) {

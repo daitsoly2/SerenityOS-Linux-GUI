@@ -241,6 +241,8 @@ void PlayerCore::rebuild_eq_filters()
 
 void PlayerCore::process_buffer(FixedArray<Audio::Sample>& buffer)
 {
+    if (on_audio_buffer)
+        on_audio_buffer(buffer);
     if (!m_eq_enabled || buffer.is_empty())
         return;
     for (size_t band = 0; band < eq_band_count; band++) {

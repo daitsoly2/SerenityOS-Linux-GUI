@@ -199,4 +199,9 @@ endpoint WindowServer
 
     set_always_on_top(i32 window_id, bool always_on_top) => ()
     start_window_drag(i32 window_id, Gfx::IntPoint screen_position) =|
+
+    set_window_transparent_color(i32 window_id, Optional<Gfx::Color> color) =|
+
+    set_window_skip_taskbar(i32 window_id, bool skip) =|
+    get_window_skip_taskbar(i32 client_id, i32 window_id) => (bool skip)
 }

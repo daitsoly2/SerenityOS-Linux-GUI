@@ -137,6 +137,7 @@ EqualizerWindow::EqualizerWindow(NonnullRefPtr<PlayerCore> core, Gfx::IntPoint f
     : m_core(move(core))
 {
     set_title(ByteString { "均衡器" });
+    set_skip_taskbar(true);
     set_obey_widget_min_size(false);
     set_resizable(false);
     set_frameless(true);
@@ -160,7 +161,36 @@ void EqualizerWindow::build_ui()
             on_context_menu_request(event);
     };
     auto& root = *root_widget;
+    m_panel = root_widget;
     root.set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 14, 6, 6 }, 5);
+
+    // Native skins carry the whole EQ chrome (including the baked-in
+    // "Preamp 31 62 ... 16k" labels) and expect the player to move the
+    // thumbs. The skin has no bitmap for that, so drive the canvas directly.
+    root_widget->on_native_action = [this](StringView name) {
+        if (name == "enabled"sv) {
+            m_core->set_eq_enabled(!m_core->eq_enabled());
+            refresh();
+        } else if (name == "reset"sv) {
+            m_core->reset_eq();
+            refresh();
+        } else if (name == "close"sv) {
+            hide();
+        }
+    };
+    root_widget->on_native_slider = [this](StringView name, float ratio) {
+        int range = PlayerCore::eq_max_gain - PlayerCore::eq_min_gain;
+        int gain = PlayerCore::eq_min_gain + static_cast<int>(ratio * static_cast<float>(range) + 0.5f);
+        if (name == "preamp"sv) {
+            m_core->set_eq_preamp(gain);
+        } else if (name.starts_with("eqfactor"sv)) {
+            auto band = name.substring_view(8).to_number<size_t>();
+            if (band.has_value() && *band < PlayerCore::eq_band_count)
+                m_core->set_eq_band_gain(*band, gain);
+        }
+        refresh();
+    };
+    root_widget->on_native_canvas_setup = [this](SkinCanvas&) { push_eq_to_canvas(); };
 
     auto& top_row = root.add<GUI::Widget>();
     top_row.set_layout<GUI::HorizontalBoxLayout>(GUI::Margins {}, 6);
@@ -217,4 +247,21 @@ void EqualizerWindow::refresh()
     for (size_t band = 0; band < m_bands.size(); band++) {
         m_bands[band]->set_value(m_core->eq_band_gain(band));
     }
+    push_eq_to_canvas();
+}
+
+void EqualizerWindow::push_eq_to_canvas()
+{
+    if (!m_panel)
+        return;
+    auto* canvas = m_panel->native_canvas();
+    if (!canvas)
+        return;
+    auto to_ratio = [](int gain) {
+        auto range = PlayerCore::eq_max_gain - PlayerCore::eq_min_gain;
+        return static_cast<float>(gain - PlayerCore::eq_min_gain) / static_cast<float>(range);
+    };
+    canvas->set_element_value("preamp"sv, to_ratio(m_core->eq_preamp()));
+    for (size_t band = 0; band < PlayerCore::eq_band_count; ++band)
+        canvas->set_element_value(ByteString::formatted("eqfactor{}", band), to_ratio(m_core->eq_band_gain(band)));
 }

@@ -56,3 +56,13 @@ Tests/LibWeb/WPT/MANIFEST.json
 
 # agent/environment-internal
 .workbuddy/
+
+# 本地临时产物（截图工作区、回收站、测试构建输出）
+.Trash-0/
+.shots/
+Ports/LinuxGUI/WlrootsHost/tests/build/
+
+# 已下线的实现：保留本地留档，不入库
+scripts/port/fcitx5-min.sh
+scripts/port/serenity-ime-daemon.sh
+Ports/LinuxGUI/IMEService/

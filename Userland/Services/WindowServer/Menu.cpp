@@ -319,10 +319,13 @@ MenuItem* Menu::hovered_item() const
 void Menu::update_for_new_hovered_item(bool make_input)
 {
     if (auto* hovered_item = this->hovered_item()) {
-        if (hovered_item->is_submenu()) {
+        // The submenu can already be gone (its client dropped the menu); do
+        // not dereference it, just treat the item as a plain one.
+        auto* submenu = hovered_item->is_submenu() ? hovered_item->submenu() : nullptr;
+        if (submenu) {
             VERIFY(menu_window());
-            MenuManager::the().close_everyone_not_in_lineage(*hovered_item->submenu());
-            hovered_item->submenu()->do_popup(hovered_item->rect().top_right().translated(-1, 0).translated(menu_window()->rect().location()), make_input, true);
+            MenuManager::the().close_everyone_not_in_lineage(*submenu);
+            submenu->do_popup(hovered_item->rect().top_right().translated(-1, 0).translated(menu_window()->rect().location()), make_input, true);
         } else {
             MenuManager::the().close_everyone_not_in_lineage(*this);
             VERIFY(menu_window());
@@ -348,25 +351,37 @@ void Menu::descend_into_submenu_at_hovered_item()
 {
     VERIFY(hovered_item());
     auto submenu = hovered_item()->submenu();
-    VERIFY(submenu);
+    // A stale submenu id (menu already destroyed) or an empty submenu must not
+    // abort the compositor; there is simply nothing to descend into.
+    if (!submenu)
+        return;
     MenuManager::the().open_menu(*submenu, true);
+    if (submenu->is_empty())
+        return;
     submenu->set_hovered_index(0);
-    VERIFY(submenu->hovered_item()->type() != MenuItem::Separator);
 }
 
 void Menu::handle_mouse_move_event(MouseEvent const& mouse_event)
 {
     VERIFY(menu_window());
     MenuManager::the().set_current_menu(this);
-    if (hovered_item() && hovered_item()->is_submenu()) {
+    // Two ways this used to dereference null and segfault the whole
+    // compositor as soon as the pointer touched a submenu item:
+    //  - submenu() resolves the id through the client and returns null when
+    //    the menu is already gone;
+    //  - a submenu with no items never gets a window, because
+    //    MenuManager::open_menu() only shows it when !is_empty().
+    // Both happen for "打开方式" on a shortcut whose target cannot be resolved.
+    auto* submenu = hovered_item() && hovered_item()->is_submenu() ? hovered_item()->submenu() : nullptr;
+    if (submenu && submenu->menu_window()) {
 
         auto item = *hovered_item();
-        auto submenu_top = item.submenu()->menu_window()->rect().top_left() - menu_window()->position();
-        auto submenu_bottom = item.submenu()->menu_window()->rect().bottom_left() - menu_window()->position();
+        auto submenu_top = submenu->menu_window()->rect().top_left() - menu_window()->position();
+        auto submenu_bottom = submenu->menu_window()->rect().bottom_left() - menu_window()->position();
 
-        if (item.submenu()->opens_to_the_left()) {
-            submenu_top = item.submenu()->menu_window()->rect().top_right() - menu_window()->position();
-            submenu_bottom = item.submenu()->menu_window()->rect().bottom_right() - menu_window()->position();
+        if (submenu->opens_to_the_left()) {
+            submenu_top = submenu->menu_window()->rect().top_right() - menu_window()->position();
+            submenu_bottom = submenu->menu_window()->rect().bottom_right() - menu_window()->position();
         }
 
         auto safe_hover_triangle = Gfx::Triangle { m_last_position_in_hover, submenu_top, submenu_bottom };

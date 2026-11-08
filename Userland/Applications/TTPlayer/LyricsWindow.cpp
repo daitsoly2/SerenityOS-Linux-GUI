@@ -17,6 +17,7 @@ LyricsWindow::LyricsWindow(NonnullRefPtr<PlayerCore> core, Gfx::IntPoint fallbac
     : m_core(move(core))
 {
     set_title(ByteString { "歌词秀" });
+    set_skip_taskbar(true);
     set_obey_widget_min_size(false);
     set_frameless(true);
     set_minimum_size(240, 160);
@@ -63,6 +64,9 @@ void LyricsWindow::build_ui()
 
     m_lyrics = &root.add<LyricsView>();
     m_lyrics->set_offset_ms(Config::read_i32("TTPlayer"sv, "Preferences"sv, "LyricOffsetMs"sv, 0));
+    // Same reason as the playlist: native skins draw the lyrics frame, the
+    // scrolling text inside it is ours.
+    root_widget->set_content_widget(*m_lyrics, "lyric"sv);
 
     update_header();
 }

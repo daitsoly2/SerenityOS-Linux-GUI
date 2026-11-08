@@ -28,6 +28,7 @@
 #include <LibGUI/MessageBox.h>
 #include <LibGUI/Process.h>
 #include <LibGUI/Window.h>
+#include <Ports/LinuxGUI/Common/AppShortcut.h>
 #include <Ports/LinuxGUI/Common/Translation.h>
 #include <Ports/LinuxGUI/Common/hostify.h>
 #include <unistd.h>
@@ -317,71 +318,23 @@ ErrorOr<NonnullRefPtr<GUI::Menu>> build_system_menu(GUI::Window& window)
     };
     Vector<LinuxDesktopApp> linux_apps;
     {
-        Vector<ByteString> dirs;
-        TRY(dirs.try_append(ByteString::formatted("{}/.local/share/applications", Core::StandardPaths::home_directory())));
-        TRY(dirs.try_append(ByteString { "/usr/local/share/applications" }));
-        TRY(dirs.try_append(ByteString { "/usr/share/applications" }));
-
-        HashTable<ByteString> seen_ids;
-        for (auto const& dir : dirs) {
-            Core::DirIterator it { dir, Core::DirIterator::SkipDots };
-            while (it.has_next()) {
-                auto filename = it.next_path();
-                if (!filename.ends_with(".desktop"sv) || seen_ids.contains(filename))
-                    continue;
-                auto path = ByteString::formatted("{}/{}", dir, filename);
-                auto config_or_error = Core::ConfigFile::open(path);
-                if (config_or_error.is_error())
-                    continue;
-                auto const& file = *config_or_error.value();
-                if (!file.has_group("Desktop Entry"))
-                    continue;
-                if (file.read_bool_entry("Desktop Entry", "NoDisplay", false)
-                    || file.read_bool_entry("Desktop Entry", "Hidden", false))
-                    continue;
-                if (file.read_entry("Desktop Entry", "Type", "Application") != "Application")
-                    continue;
-                // Terminal apps need a terminal emulator to make sense on this
-                // desktop; skip them until launching one is wired up.
-                if (file.read_bool_entry("Desktop Entry", "Terminal", false))
-                    continue;
-                // Prefer the locale-specific Name (Name[zh_CN] / Name[zh]) so
-                // Linux-native apps show a Chinese label in the Start menu.
-                // Anything still English falls through to the [UI] catalog,
-                // which Action::create() applies automatically.
-                auto name = file.read_entry("Desktop Entry", "Name[zh_CN]").trim_whitespace();
-                if (name.is_empty())
-                    name = file.read_entry("Desktop Entry", "Name[zh]").trim_whitespace();
-                if (name.is_empty())
-                    name = file.read_entry("Desktop Entry", "Name").trim_whitespace();
-                auto exec = file.read_entry("Desktop Entry", "Exec").trim_whitespace();
-                if (name.is_empty() || exec.is_empty())
-                    continue;
-
-                // Drop the field codes ("%U", "%f", ...) launchers append to Exec.
-                if (auto percent = exec.find('%'); percent.has_value())
-                    exec = exec.substring(0, percent.value()).trim_whitespace();
-
-                LinuxDesktopApp app;
-                app.name = name;
-                app.icon_name = file.read_entry("Desktop Entry", "Icon").trim_whitespace();
-                app.path = path;
-                auto override = StartMenuOverrides::get(path);
-                app.hidden = override.hidden;
-                app.category = override.category;
-                for (auto& argument : exec.split(' ')) {
-                    if (argument.is_empty())
-                        continue;
-                    if (app.program.is_empty())
-                        app.program = argument;
-                    else
-                        TRY(app.arguments.try_append(argument));
-                }
-                if (app.program.is_empty())
-                    continue;
-                seen_ids.set(filename);
-                TRY(linux_apps.try_append(move(app)));
-            }
+        // One unified scan: .desktop files are converted to the native .af
+        // shape once, saved, and reused on later runs (see AppShortcut.h).
+        // belongs_in_start_menu() is what keeps console tools / setup helpers
+        // that ship with Terminal=false out of the menu.
+        for (auto& record : PortShortcuts::scan(PortShortcuts::xdg_application_directories())) {
+            if (!PortShortcuts::belongs_in_start_menu(record))
+                continue;
+            LinuxDesktopApp app;
+            app.name = record.name;
+            app.program = record.program;
+            app.arguments = record.arguments;
+            app.icon_name = record.icon_spec;
+            app.path = record.source_file;
+            auto override = StartMenuOverrides::get(record.source_file);
+            app.hidden = override.hidden;
+            app.category = override.category;
+            TRY(linux_apps.try_append(move(app)));
         }
         quick_sort(linux_apps, [](auto& a, auto& b) { return a.name < b.name; });
     }
@@ -406,25 +359,8 @@ ErrorOr<NonnullRefPtr<GUI::Menu>> build_system_menu(GUI::Window& window)
         auto* parent_menu = app.category.is_empty() ? linux_menu.ptr() : menu_for_category(app.category);
         if (!parent_menu)
             continue;
-        RefPtr<Gfx::Bitmap> icon;
-        if (!app.icon_name.is_empty()) {
-            if (app.icon_name.starts_with('/')) {
-                if (auto bitmap = Gfx::Bitmap::load_from_file(app.icon_name); !bitmap.is_error())
-                    icon = bitmap.release_value();
-            } else {
-                // Freedesktop icon names: probe the common sizes/paths.
-                for (auto const& candidate : Vector<ByteString> {
-                         ByteString::formatted("/usr/share/icons/hicolor/16x16/apps/{}.png", app.icon_name),
-                         ByteString::formatted("/usr/share/icons/hicolor/32x32/apps/{}.png", app.icon_name),
-                         ByteString::formatted("/usr/share/pixmaps/{}.png", app.icon_name) }) {
-                    if (access(candidate.characters(), R_OK) == 0) {
-                        if (auto bitmap = Gfx::Bitmap::load_from_file(candidate); !bitmap.is_error())
-                            icon = bitmap.release_value();
-                        break;
-                    }
-                }
-            }
-        }
+        // Path, theme name (PNG or SVG) or an executable - one resolver.
+        auto icon = PortIcons::resolve(app.icon_name, 16);
         auto captured_identifier = linux_app_identifier;
         add_managed_action(*parent_menu,
             GUI::Action::create(app.name, icon, [captured_identifier, &window, linux_apps](auto&) {

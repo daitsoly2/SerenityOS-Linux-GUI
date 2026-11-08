@@ -98,6 +98,7 @@ static StringView icon_name_for_key(StringView key)
     if (key == "ImeSettings"sv) return "app-keyboard-settings"sv;
     if (key == "MouseSettings"sv) return "app-mouse"sv;
     if (key == "FileAssociations"sv) return "app-file-manager"sv;
+    if (key == "PrintSettings"sv) return "printer"sv;
     return "app-settings"sv;
 }
 
@@ -149,9 +150,10 @@ static Category s_categories[] = {
           { "配置中文输入法"sv, "ImeSettings"sv } },
         { "ClockSettings"sv, "CalendarSettings"sv, "KeyboardSettings"sv, "ImeSettings"sv } },
     { "打印机和其它硬件"sv, "app-mouse"sv,
-        { { "更改鼠标设置"sv, "MouseSettings"sv },
+        { { "管理打印机和打印任务"sv, "PrintSettings"sv },
+          { "更改鼠标设置"sv, "MouseSettings"sv },
           { "更改键盘设置"sv, "KeyboardSettings"sv } },
-        { "MouseSettings"sv, "KeyboardSettings"sv } },
+        { "PrintSettings"sv, "MouseSettings"sv, "KeyboardSettings"sv } },
     { "文件和文件夹"sv, "app-file-manager"sv,
         { { "更改文件类型关联"sv, "FileAssociations"sv } },
         { "FileAssociations"sv } },

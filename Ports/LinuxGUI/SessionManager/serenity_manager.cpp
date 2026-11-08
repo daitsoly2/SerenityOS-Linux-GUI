@@ -508,7 +508,15 @@ ErrorOr<int> serenity_main(Main::Arguments)
     // other ported GUI apps. Spawned explicitly because systemd socket
     // activation (Lazy=true in SystemServerUser.ini) is not implemented here,
     // so the portal socket would otherwise never exist.
-    g_children.append(make_child(ByteString { "file-system-access-server" }, ByteString { "serenity-file-system-access-server" }, {}, true));
+    // This one exits with status 0 when WindowServer dies (its GUI::Application
+    // loses the connection), and reap_children() treats a clean exit as "the
+    // user closed it" unless always_restart is set. Without this flag a single
+    // WS crash leaves a stale portal socket behind and *every* app then aborts
+    // in FileSystemAccessClient::Client::the() - no File/Open/Save dialogs at
+    // all until the next full login.
+    auto filesystem_access_server_child = make_child(ByteString { "file-system-access-server" }, ByteString { "serenity-file-system-access-server" }, {}, true);
+    filesystem_access_server_child->always_restart = true;
+    g_children.append(move(filesystem_access_server_child));
     // D-Bus session bus. Nothing else starts one for this service (it has no
     // PAMName=login session, so there is no dbus.socket), and without it fcitx5
     // exits immediately on startup, GTK apps cannot reach xdg-desktop-portal and
@@ -554,9 +562,16 @@ ErrorOr<int> serenity_main(Main::Arguments)
         }
     }
     // Audio: AudioServer mixes into /dev/audio/0 (serenity_compat), the bridge
-    // forwards that PCM to the host's sound card.
-    g_children.append(make_child(ByteString { "audio-server" }, ByteString { "serenity-audio-server" }, {}, true));
-    g_children.append(make_child(ByteString { "audio-bridge" }, ByteString { "serenity-audio-bridge" }, {}, true));
+    // forwards that PCM to the host's sound card. Without the compat module the
+    // server spins on a failed sample-rate ioctl with no backoff - 600k log
+    // lines in 30 minutes on this machine - so only start it when the device is
+    // actually there.
+    if (access("/dev/audio/0", R_OK | W_OK) == 0) {
+        g_children.append(make_child(ByteString { "audio-server" }, ByteString { "serenity-audio-server" }, {}, true));
+        g_children.append(make_child(ByteString { "audio-bridge" }, ByteString { "serenity-audio-bridge" }, {}, true));
+    } else {
+        log_line("audio: /dev/audio/0 missing, skipping AudioServer (no serenity_compat)"sv);
+    }
     auto window_server_child = make_child(ByteString { "window-server" }, ByteString { "serenity-window-server" }, { ByteString { "--config" }, ByteString { "/etc/WindowServer.ini" } }, true);
     window_server_child->always_restart = true;
     g_children.append(move(window_server_child));
@@ -639,12 +654,20 @@ ErrorOr<int> serenity_main(Main::Arguments)
     // no input method. The X_OK filter below drops it entirely when fcitx5 is
     // not installed.
     {
-        setenv("GTK_IM_MODULE", "fcitx", 0);
-        setenv("QT_IM_MODULE", "fcitx", 0);
-        setenv("XMODIFIERS", "@im=fcitx", 0);
+        // GTK/Qt 必须走**原生 Wayland IM**（zwp_text_input_v3），才会创建
+        // text_input 并连到 serenity-ime 服务。设成 "fcitx" 会去连 fcitx5 的
+        // GTK/Qt IM 模块，而定制版 fcitx5 已裁掉 dbus/waylandim ⇒ 连不上、
+        // 键被吞，表现为「gedit 完全不能输入」。
+        unsetenv("GTK_IM_MODULE");
+        unsetenv("QT_IM_MODULE");
+        setenv("XMODIFIERS", "@im=serenity", 0);
         // XIM needs the X server Wine and other X11 clients actually use.
         setenv("DISPLAY", ":100", 0);
-        g_children.append(make_child(ByteString { "ime" }, ByteString { "/usr/bin/fcitx5" }, {}, true));
+        // 引擎＝serenity-engine（直链 librime）。fcitx5 已退役：它在这套架构里
+        // 只负责「加载 rime」，却带来 34 个包、一个必须靠 shell 脚本守护的进程，
+        // 以及 unload 时的析构崩溃。引擎是普通进程，掉线由 make_child 的
+        // always_restart 拉回，不再需要守护脚本。
+        g_children.append(make_child(ByteString { "ime" }, ByteString { "/serenity/bin/serenity-engine" }, {}, true));
     }
 
     // One shell process: desktop (wallpaper + icons) and taskbar (start menu,
@@ -660,6 +683,9 @@ ErrorOr<int> serenity_main(Main::Arguments)
     // eBPF 采集每进程网络流量（kprobe tcp_sendmsg/tcp_recvmsg）。加载失败就自己退出，
     // 不要重启循环：任务管理器读不到文件时会退回网卡级统计。
     g_children.append(make_child(ByteString { "netprobe" }, ByteString { "serenity-netprobe" }, {}, false));
+    // 打印服务：把 CUPS 包一层 Unix socket，所有 app 的「打印」都走它，
+    // 应用自己不再 fork lp。没有打印机时它照常运行（LIST 返回空）。
+    g_children.append(make_child(ByteString { "print-service" }, ByteString { "serenity-print-service" }, {}, true));
 
     // Components that are built separately (or not at all) must not turn into a
     // restart loop: drop the ones whose binary is missing.
@@ -826,6 +852,11 @@ ErrorOr<int> serenity_main(Main::Arguments)
                 log_line("D-Bus session bus socket never appeared - fcitx5 and GTK/Qt apps will not find a session bus"sv);
         }
     }
+
+    // Printing front-end: needs the session bus (it posts its progress through
+    // org.freedesktop.Notifications) and must be up before the first app asks.
+    if (auto* printer = find_child("print-service"sv))
+        (void)spawn(*printer);
 
     // Input method before the shell starts apps: the first focused text box
     // should find an engine socket instead of quietly typing English only.

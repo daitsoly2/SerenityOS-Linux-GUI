@@ -254,6 +254,11 @@ Environment=HOME=${SESSION_HOME}
 Environment=SERENITY_PREFIX=${PREFIX}
 Environment=SERENITY_BIN=${PREFIX}/bin
 Environment=PATH=${PREFIX}/bin:/usr/local/bin:/usr/bin:/bin
+# 输入法：现在是 serenity-engine 直连 librime。不要导出 GTK_IM_MODULE /
+# QT_IM_MODULE -- SessionManager 会 unset 它们，让 GTK/Qt 用原生 Wayland
+# text_input_v3；桌面外启动的 Linux 客户端靠下面两行找到 XIM / 引擎 socket。
+Environment=XMODIFIERS=@im=serenity
+Environment=SERENITY_IME_SOCKET=/tmp/serenity-ime.sock
 # serenitid/splash paths: progress lives in a RuntimeDirectory owned by the
 # user; the log lands in /tmp (writable without root).
 Environment=SERENITY_PROGRESS=/run/serenity/progress

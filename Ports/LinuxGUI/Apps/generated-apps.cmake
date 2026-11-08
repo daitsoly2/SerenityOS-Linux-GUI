@@ -569,6 +569,8 @@ add_executable(serenity-t-t-player
     ${TTPlayer_DIR}/PlaylistStore.cpp
     ${TTPlayer_DIR}/PlaylistWindow.cpp
     ${TTPlayer_DIR}/SkinButton.cpp
+    ${TTPlayer_DIR}/SkinCanvas.cpp
+    ${TTPlayer_DIR}/SkinDocument.cpp
     ${TTPlayer_DIR}/SkinPanel.cpp
     ${TTPlayer_DIR}/SkinText.cpp
     ${TTPlayer_DIR}/SkinTheme.cpp
@@ -657,6 +659,22 @@ add_executable(serenity-win-apps-settings
 target_include_directories(serenity-win-apps-settings PRIVATE ${WinAppsSettings_DIR})
 target_link_libraries(serenity-win-apps-settings PRIVATE LibConfig LibCore LibDesktop LibFileSystem LibGUI LibGfx LibMain LibURL)
 set_target_properties(serenity-win-apps-settings PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+# PrintSettings (app)
+#
+# CUPS-backed print management: lists queues with their live state, and lets
+# the user add/remove printers, pause or resume them, set the default queue,
+# print a test page and cancel pending jobs. Talks to the host CUPS through
+# the standard CLI (lpstat/lpadmin/cupsenable/...) with an LC_ALL=C wrapper;
+# queue administration falls back to `sudo -n` when the caller is not allowed
+# (the session user is added to the lpadmin group at install time).
+set(PrintSettings_DIR "${SERENITY_PROJECT_ROOT}/Userland/Applications/PrintSettings")
+add_executable(serenity-print-settings
+    ${PrintSettings_DIR}/main.cpp
+)
+target_include_directories(serenity-print-settings PRIVATE ${PrintSettings_DIR})
+target_link_libraries(serenity-print-settings PRIVATE LibCore LibGUI LibGfx LibMain)
+set_target_properties(serenity-print-settings PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 # BrickGame (game)
 set(BrickGame_DIR "${SERENITY_PROJECT_ROOT}/Userland/Games/BrickGame")

@@ -1,0 +1,47 @@
+<skin version="2" name="¾§Ó¨ÌÞÍ¸" author="ºÜ¸ßºÜÊÝ" url="http://ttplayer.com" email="mailto:tallboythinboy@163.com" transparent_color="#ff00ff">
+   <player_window image="player_skin.bmp">
+      <play position="39, 89, 61, 107" image="play.bmp"/>
+      <pause position="39, 89, 61, 107" image="pause.bmp"/>
+      <stop position="62, 89, 84, 107" image="stop.bmp"/>
+      <prev position="16, 89, 38, 107" image="prev.bmp"/>
+      <next position="85, 89, 107, 107" image="next.bmp"/>
+      <mute position="143, 58, 162, 72" image="mute.bmp"/>
+      <open position="114, 89, 146, 106" image="open.bmp"/>
+      <lyric position="146, 92, 174, 105" image="lyric.bmp"/>
+      <equalizer position="212, 92, 240, 105" image="lyric.bmp"/>
+      <playlist position="179, 92, 207, 105" image="lyric.bmp"/>
+      <minimize position="242, 4, 256, 18" image="minimize.bmp"/>
+      <exit position="256, 4, 270, 18" image="close.bmp"/>
+      <progress position="4, 73, 270, 80" bar_image="" thumb_image="volume_pro.bmp"/>
+      <volume position="169, 63, 215, 69" vertical="false" bar_image="" thumb_image="thumb.bmp" fill_image="volume_fill.bmp"/>
+      <visual position="24, 43, 99, 58"/>
+      <icon position="248, 91, 264, 107"/>
+      <info position="112, 27, 265, 39" color="#437BA7" bkgnd="#CAF5FE" font="simsong" font_size="12"/>
+      <led position="32, 26, 92, 39" image="number.bmp" algin="right"/>
+      <stereo position="230, 54, 268, 66" color="#437BA7" font="simsong" font_size="12" align="right"/>
+      <status position="200, 42, 268, 54" color="#437BA7" font="simsong" font_size="12" align="right"/>
+   </player_window>
+   <lyric_window position="275, 0, 550, 116" resize_rect="25, 25, 150, 60" image="lyric_skin.bmp">
+      <lyric position="17, 20, 259, 106"/>
+      <title position="106, 0, 169, 20" image="lyric_title.bmp" align="center"/>
+      <ontop position="245, 5, 255, 16" image="ontop.bmp" align="right"/>
+      <close position="256, 4, 270, 18" image="close.bmp" align="right"/>
+  </lyric_window>
+   <equalizer_window position="275, 116, 550, 232" image="equalizer_skin.bmp" eq_interval="8">
+      <close position="256, 4, 270, 18" image="close.bmp" align="right"/>
+      <enabled position="41, 42, 69, 55" image="lyric.bmp"/>
+      <profile position="41, 85, 69, 98" image="eq_profile.bmp"/>
+      <reset position="42, 64, 66, 76" image="eq_reset.bmp"/>
+      <balance position="22, 21, 126, 31" thumb_image="thumb.bmp" bar_image=""/>
+      <surround position="149, 21, 253, 31" thumb_image="thumb.bmp" bar_image=""/>
+      <preamp position="22, 39, 32, 102" thumb_image="eq_thumb.bmp" bar_image=""/>
+      <eqfactor position="79, 38, 89, 102" thumb_image="eq_thumb.bmp" bar_image="" fill_image=""/>
+   </equalizer_window>
+   <playlist_window position="0, 116, 275, 232" resize_rect="27, 43, 250, 100" image="playlist_skin.bmp" hilight="#0000ff">
+      <close position="256, 4, 270, 18" image="close.bmp" align="right"/>
+      <title position="135, 0, 209, 20" image="playlist_title.bmp" align="center"/>
+      <toolbar position="17, 20, 245, 39"/>
+      <playlist position="17, 40, 259, 105"/>
+      <scrollbar buttons_image="scrollbar_button.bmp" thumb_image="scrollbar_thumb.bmp" bar_image="scrollbar_bar.bmp" thumb_resize_center="2"/>
+   </playlist_window>
+</skin>

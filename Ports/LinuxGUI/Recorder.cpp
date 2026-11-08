@@ -31,7 +31,11 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -153,6 +157,11 @@ Recorder& Recorder::the()
 
 void Recorder::initialize()
 {
+    // Frames go into an ffmpeg child's stdin on the local path. If ffmpeg dies,
+    // write() raises SIGPIPE and the default action would kill the compositor;
+    // ignore it so write() just returns EPIPE (which becomes a dropped frame).
+    signal(SIGPIPE, SIG_IGN);
+
     auto& recorder = the();
     recorder.m_output_directory = ByteString::formatted("{}/Videos", Core::StandardPaths::home_directory());
     if (char const* dir = getenv("SERENITY_RECORDER_DIR"); dir && *dir)
@@ -358,11 +367,150 @@ void Recorder::set_output_directory(ByteString path)
 
 // ── capture stream ──────────────────────────────────────────────────────────
 
-bool Recorder::open_capture_stream()
+static ByteString pick_local_encoder(ByteString& vaapi_device)
 {
-    auto host = ByteString { "10.0.2.2" };
-    if (char const* value = getenv("SERENITY_RECORDER_HOST"); value && *value)
-        host = ByteString { value };
+    if (char const* value = getenv("SERENITY_RECORDER_VAAPI_DEVICE"); value && *value)
+        vaapi_device = ByteString { value };
+    else
+        vaapi_device = ByteString { "/dev/dri/renderD128" };
+
+    if (char const* value = getenv("SERENITY_RECORDER_ENCODER"); value && *value)
+        return ByteString { value };
+
+    // This machine's only usable H.264 encoder is Intel Quick Sync (Haswell,
+    // i965 VAAPI driver), so VAAPI comes first. NVENC is kept for hosts that
+    // have a discrete GPU that can actually encode, x264 is the last resort.
+    if (access(vaapi_device.characters(), R_OK | W_OK) == 0 && access("/usr/lib/x86_64-linux-gnu/dri/i965_drv_video.so", R_OK) == 0)
+        return ByteString { "h264_vaapi" };
+
+    if (FILE* pipe = popen("ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_nvenc && echo nvenc", "r")) {
+        char buffer[32] {};
+        auto* line = fgets(buffer, sizeof(buffer), pipe);
+        pclose(pipe);
+        if (line && !strncmp(buffer, "nvenc", 5))
+            return ByteString { "h264_nvenc" };
+    }
+    return ByteString { "libx264" };
+}
+
+// Local transport (the gsr model): ffmpeg runs as a child of WindowServer and
+// encodes the raw frames we write into its stdin. No network hop, no host-side
+// daemon, and the output file lands directly in the session's ~/Videos.
+bool Recorder::open_local_encoder(int width, int height)
+{
+    ByteString vaapi_device;
+    auto encoder = pick_local_encoder(vaapi_device);
+
+    Vector<ByteString> arguments;
+    arguments.append(ByteString { "ffmpeg" });
+    arguments.append(ByteString { "-hide_banner" });
+    arguments.append(ByteString { "-loglevel" });
+    arguments.append(ByteString { "error" });
+    arguments.append(ByteString { "-y" });
+    if (encoder == "h264_vaapi"sv) {
+        // Global option: must appear before the input.
+        arguments.append(ByteString { "-vaapi_device" });
+        arguments.append(vaapi_device);
+    }
+    arguments.append(ByteString { "-f" });
+    arguments.append(ByteString { "rawvideo" });
+    arguments.append(ByteString { "-pix_fmt" });
+    arguments.append(ByteString { "bgr0" });
+    arguments.append(ByteString { "-s" });
+    arguments.append(ByteString::formatted("{}x{}", width, height));
+    arguments.append(ByteString { "-framerate" });
+    arguments.append(ByteString::formatted("{}", m_fps));
+    arguments.append(ByteString { "-use_wallclock_as_timestamps" });
+    arguments.append(ByteString { "1" });
+    arguments.append(ByteString { "-i" });
+    arguments.append(ByteString { "pipe:0" });
+    arguments.append(ByteString { "-c:v" });
+    arguments.append(encoder);
+    if (encoder == "h264_vaapi"sv) {
+        // Upload to the GPU as NV12; VAAPI frames go straight into the muxer,
+        // so no software -pix_fmt yuv420p afterwards.
+        arguments.append(ByteString { "-vf" });
+        arguments.append(ByteString { "format=nv12,hwupload" });
+        arguments.append(ByteString { "-qp" });
+        arguments.append(ByteString { "23" });
+    } else if (encoder == "h264_nvenc"sv) {
+        arguments.append(ByteString { "-preset" });
+        arguments.append(ByteString { "medium" });
+        arguments.append(ByteString { "-cq" });
+        arguments.append(ByteString { "23" });
+        arguments.append(ByteString { "-pix_fmt" });
+        arguments.append(ByteString { "yuv420p" });
+    } else {
+        arguments.append(ByteString { "-preset" });
+        arguments.append(ByteString { "veryfast" });
+        arguments.append(ByteString { "-crf" });
+        arguments.append(ByteString { "20" });
+        arguments.append(ByteString { "-pix_fmt" });
+        arguments.append(ByteString { "yuv420p" });
+    }
+    arguments.append(ByteString { "-movflags" });
+    arguments.append(ByteString { "+faststart" });
+    arguments.append(m_last_output_path);
+
+    Vector<char const*> argv;
+    for (auto& argument : arguments)
+        argv.append(argument.characters());
+    argv.append(nullptr);
+
+    int pipe_fds[2] {};
+    if (pipe(pipe_fds) < 0) {
+        warnln("Recorder: pipe failed: {}", strerror(errno));
+        return false;
+    }
+    (void)fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(pipe_fds[1], F_SETFD, FD_CLOEXEC);
+
+    auto pid = fork();
+    if (pid < 0) {
+        warnln("Recorder: fork failed: {}", strerror(errno));
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        return false;
+    }
+    if (pid == 0) {
+        dup2(pipe_fds[0], STDIN_FILENO);
+        close(pipe_fds[0]);
+        close(pipe_fds[1]);
+        // Haswell is Gen7.5: the iHD driver does not support it, i965 does.
+        if (encoder == "h264_vaapi"sv)
+            setenv("LIBVA_DRIVER_NAME", "i965", 1);
+        execvp("ffmpeg", const_cast<char**>(argv.data()));
+        _exit(127);
+    }
+
+    close(pipe_fds[0]);
+    // Non-blocking writes: a stalled encoder costs a dropped frame, never a
+    // frozen compositor.
+    (void)fcntl(pipe_fds[1], F_SETFL, fcntl(pipe_fds[1], F_GETFL, 0) | O_NONBLOCK);
+    // One 1080p frame is 8.3 MB; a larger pipe means fewer write() round-trips
+    // through the event loop.
+    (void)fcntl(pipe_fds[1], F_SETPIPE_SZ, 1 << 20);
+
+    m_capture_fd = pipe_fds[1];
+    m_encoder_pid = pid;
+    m_local_encoder = true;
+    m_stream_open = true;
+    outln("Recorder: local encoder {} (pid {}) -> {}", encoder, pid, m_last_output_path);
+    return true;
+}
+
+bool Recorder::open_capture_stream(int width, int height)
+{
+    // Transport selection:
+    //   SERENITY_RECORDER_HOST set -> raw frames over TCP to a host-side encoder
+    //     (the QEMU setup: no ffmpeg inside the guest, 10.0.2.2 is the host).
+    //   otherwise -> local ffmpeg child over a pipe (the gsr model, and the
+    //     only option on real hardware where 10.0.2.2 does not exist).
+    char const* host_value = getenv("SERENITY_RECORDER_HOST");
+    if (!host_value || !*host_value || !strcmp(host_value, "local"))
+        return open_local_encoder(width, height);
+
+    auto host = ByteString { host_value };
     u16 port = default_host_port;
     if (char const* value = getenv("SERENITY_RECORDER_PORT"); value && *value) {
         if (auto parsed = ByteString { value }.to_number<u16>(); parsed.has_value())
@@ -384,11 +532,41 @@ bool Recorder::open_capture_stream()
         return false;
     }
 
-    if (connect(fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        warnln("Recorder: cannot reach the encoder at {}:{} ({})", host, port, strerror(errno));
+    // connect() must never block the compositor: the default encoder address
+    // (10.0.2.2) is QEMU's host alias and does not exist on a real machine, so
+    // a blocking connect waits for the kernel's SYN retries (~2 minutes) on the
+    // frame path - the desktop appears to hard-freeze as soon as recording
+    // starts. Connect non-blocking with a 500ms deadline, then return to
+    // blocking sends (SO_SNDTIMEO below is the safety net for a stalled
+    // encoder).
+    int socket_flags = fcntl(fd, F_GETFL, 0);
+    if (socket_flags < 0 || fcntl(fd, F_SETFL, socket_flags | O_NONBLOCK) < 0) {
+        warnln("Recorder: cannot switch socket to non-blocking: {}", strerror(errno));
         close(fd);
         return false;
     }
+    if (connect(fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+        if (errno != EINPROGRESS) {
+            warnln("Recorder: cannot reach the encoder at {}:{} ({})", host, port, strerror(errno));
+            close(fd);
+            return false;
+        }
+        struct pollfd poll_fd {
+            fd, POLLOUT, 0
+        };
+        int ready = poll(&poll_fd, 1, 500);
+        int socket_error = 0;
+        socklen_t socket_error_length = sizeof(socket_error);
+        if (ready <= 0
+            || getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_length) < 0
+            || socket_error != 0) {
+            warnln("Recorder: encoder at {}:{} did not accept within 500ms ({})",
+                host, port, ready <= 0 ? "timeout" : strerror(socket_error));
+            close(fd);
+            return false;
+        }
+    }
+    (void)fcntl(fd, F_SETFL, socket_flags);
 
     // Nagle would add 40ms of latency to every frame; there is exactly one
     // writer and the frames are already large, so it buys us nothing.
@@ -413,11 +591,29 @@ bool Recorder::open_capture_stream()
 void Recorder::close_capture_stream()
 {
     if (m_capture_fd >= 0) {
-        // Half-close so the encoder sees a clean EOF and finalises the file.
-        shutdown(m_capture_fd, SHUT_WR);
-        close(m_capture_fd);
+        if (m_local_encoder) {
+            // Closing stdin gives ffmpeg EOF; wait (briefly) for it to finish
+            // the mp4 so the file is complete when we announce it.
+            close(m_capture_fd);
+            m_capture_fd = -1;
+            if (m_encoder_pid > 0) {
+                int status = 0;
+                for (int attempt = 0; attempt < 300; ++attempt) {
+                    if (waitpid(m_encoder_pid, &status, WNOHANG) != 0)
+                        break;
+                    usleep(10 * 1000);
+                }
+                m_encoder_pid = -1;
+            }
+        } else {
+            // Half-close so the host encoder sees a clean EOF and finalises it.
+            shutdown(m_capture_fd, SHUT_WR);
+            close(m_capture_fd);
+            m_capture_fd = -1;
+        }
     }
     m_capture_fd = -1;
+    m_local_encoder = false;
     m_stream_open = false;
     m_frame_in_flight = false;
     m_frame_offset = 0;
@@ -436,15 +632,20 @@ void Recorder::on_frame_tick()
     if (source_width <= 0 || source_height <= 0)
         return;
 
-    // QEMU's user-mode network tops out around 130 MB/s, and one 1080p frame
-    // is 7.3 MB raw, so a native-resolution stream can never reach 30 fps.
-    // Scale down to the capture budget instead of silently dropping half the
-    // frames: a sharp 720p30 beats a stuttering 1080p14.
+    // The 1152 cap existed for QEMU's ~130 MB/s user-mode network. A local
+    // encoder has no such ceiling: keep full resolution unless the user asked
+    // for a specific width, or the TCP transport is in use.
+    auto max_capture_width = s_max_capture_width;
+    char const* host_value = getenv("SERENITY_RECORDER_HOST");
+    bool const local_encoder = !host_value || !*host_value || !strcmp(host_value, "local");
+    if (local_encoder && !getenv("SERENITY_RECORDER_WIDTH"))
+        max_capture_width = 4096;
+
     auto width = source_width;
     auto height = source_height;
-    if (width > s_max_capture_width) {
-        height = (int)((long)source_height * s_max_capture_width / source_width);
-        width = s_max_capture_width;
+    if (width > max_capture_width) {
+        height = (int)((long)source_height * max_capture_width / source_width);
+        width = max_capture_width;
         if (height <= 0)
             height = 1;
     }
@@ -458,21 +659,25 @@ void Recorder::on_frame_tick()
     auto needed = stride * (size_t)height;
 
     if (!m_stream_open) {
-        if (!open_capture_stream()) {
+        if (!open_capture_stream(width, height)) {
             m_capture_failed = true;
             stop_recording();
             show_toast("Recording backend is not running"sv);
             return;
         }
-        auto header = ByteString::formatted("SERENITYREC 1 {} {} {} {}\n", width, height, m_fps, m_current_filename);
-        auto written = send(m_capture_fd, header.characters(), header.length(), MSG_NOSIGNAL);
-        if (written != (ssize_t)header.length()) {
-            warnln("Recorder: failed to send stream header");
-            close_capture_stream();
-            m_capture_failed = true;
-            stop_recording();
-            show_toast("Recording backend rejected the stream"sv);
-            return;
+        // The local ffmpeg child has width/height on its command line; only
+        // the TCP protocol needs the extra header line.
+        if (!m_local_encoder) {
+            auto header = ByteString::formatted("SERENITYREC 1 {} {} {} {}\n", width, height, m_fps, m_current_filename);
+            auto written = send(m_capture_fd, header.characters(), header.length(), MSG_NOSIGNAL);
+            if (written != (ssize_t)header.length()) {
+                warnln("Recorder: failed to send stream header");
+                close_capture_stream();
+                m_capture_failed = true;
+                stop_recording();
+                show_toast("Recording backend rejected the stream"sv);
+                return;
+            }
         }
     }
 
@@ -503,7 +708,11 @@ void Recorder::pump_pending_frame()
 {
     while (m_capture_fd >= 0 && m_frame_offset < m_frame_size) {
         auto remaining = m_frame_size - m_frame_offset;
-        auto sent = send(m_capture_fd, m_frame_buffer.data() + m_frame_offset, remaining, MSG_NOSIGNAL);
+        // A pipe is not a socket: write() instead of send(). MSG_NOSIGNAL has
+        // no equivalent, so SIGPIPE is ignored for the whole process below.
+        auto sent = m_local_encoder
+            ? (ssize_t)::write(m_capture_fd, m_frame_buffer.data() + m_frame_offset, remaining)
+            : send(m_capture_fd, m_frame_buffer.data() + m_frame_offset, remaining, MSG_NOSIGNAL);
         if (sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // SO_SNDTIMEO expired: the encoder stopped reading. Cut the

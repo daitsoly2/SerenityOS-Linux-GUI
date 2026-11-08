@@ -6,6 +6,7 @@
 
 #include "SkinTheme.h"
 #include <AK/LexicalPath.h>
+#include <AK/StringBuilder.h>
 #include <LibConfig/Client.h>
 #include <LibCore/ConfigFile.h>
 #include <LibCore/Command.h>
@@ -40,6 +41,32 @@ bool has_image_extension(StringView path)
         || path.ends_with(".png"sv, CaseSensitivity::CaseInsensitive)
         || path.ends_with(".jpg"sv, CaseSensitivity::CaseInsensitive)
         || path.ends_with(".jpeg"sv, CaseSensitivity::CaseInsensitive);
+}
+
+// M4Player/千千静听 skin packs are 24-bit bitmaps with no alpha channel; one
+// magic RGB marks the holes. Accept "255,0,255", "#ff00ff" and friends.
+Optional<Gfx::Color> parse_mask_color(StringView value)
+{
+    value = value.trim_whitespace();
+    if (value.is_empty())
+        return {};
+    auto parts = value.split_view(',');
+    if (parts.size() == 3) {
+        int channel[3];
+        for (size_t i = 0; i < 3; ++i) {
+            channel[i] = parts[i].trim_whitespace().to_number<int>().value_or(-1);
+            if (channel[i] < 0 || channel[i] > 255)
+                return {};
+        }
+        return Gfx::Color::from_rgb((channel[0] << 16) | (channel[1] << 8) | channel[2]);
+    }
+    // Hex form: #rrggbb / rrggbb / 0xrrggbb. parse_color() returns its
+    // fallback on malformed input, so pick a value no sane key would use.
+    constexpr u32 invalid = 0x010203;
+    auto color = TTSkin::parse_color(value, Gfx::Color::from_rgb(invalid));
+    if ((color.value() & 0x00ffffff) == invalid)
+        return {};
+    return Gfx::Color::from_rgb(color.value() & 0x00ffffff);
 }
 
 }
@@ -104,6 +131,23 @@ Optional<Gfx::IntRect> SkinTheme::window_geometry(WindowKind kind) const
     if (m_current_index < 0 || m_current_index >= count())
         return {};
     return m_skins[static_cast<size_t>(m_current_index)].layout_for(kind);
+}
+
+Optional<Gfx::Color> SkinTheme::transparent_color() const
+{
+    if (m_current_index < 0 || m_current_index >= count())
+        return {};
+    return m_skins[static_cast<size_t>(m_current_index)].transparent_color;
+}
+
+SkinDocument const* SkinTheme::native_document() const
+{
+    if (m_current_index < 0 || m_current_index >= count())
+        return nullptr;
+    auto const& document = m_skins[static_cast<size_t>(m_current_index)].document;
+    if (!document.has_value() || !document->valid)
+        return nullptr;
+    return &document.value();
 }
 
 void SkinTheme::select(int index)
@@ -184,6 +228,38 @@ void SkinTheme::rescan()
 
 void SkinTheme::load_skin(Skin& skin, StringView directory)
 {
+    // Native Skin.xml wins: it is the only format that describes the controls,
+    // not just the backdrop. A pack carrying both Skin.xml and skin.ini must
+    // keep its control layout instead of degrading to a plain background.
+    auto document = SkinDocument::load(directory);
+    if (document.valid) {
+        if (!document.name.is_empty())
+            skin.name = document.name;
+        skin.transparent_color = document.transparent_color;
+        if (!skin.transparent_color.has_value())
+            skin.transparent_color = Gfx::Color::from_rgb(0xff00ff);
+
+        // Native panel `position` is already main-window-relative (l,t,r,b
+        // converted to x,y,w,h by SkinDocument). When a window omits it the
+        // backdrop bitmap itself defines the size.
+        auto apply = [&](SkinPanelLayout const& layout, RefPtr<Gfx::Bitmap>& bitmap, int index) {
+            if (layout.background)
+                bitmap = layout.background;
+            if (!layout.position.is_empty())
+                skin.geometry[index] = layout.position;
+            else if (layout.background)
+                skin.geometry[index] = Gfx::IntRect { 0, 0, layout.background->width(), layout.background->height() };
+        };
+        apply(document.main, skin.main_background, 0);
+        apply(document.playlist, skin.playlist_background, 1);
+        apply(document.lyrics, skin.lyrics_background, 2);
+        apply(document.equalizer, skin.equalizer_background, 3);
+
+        skin.document = move(document);
+        detect_backgrounds(skin);
+        return;
+    }
+
     auto ini_path = ByteString::formatted("{}/skin.ini", directory);
     auto alt_ini_path = ByteString::formatted("{}/Skin.ini", directory);
     auto oop_manifest = ByteString::formatted("{}/Skin_OOP.xml", directory);
@@ -209,6 +285,13 @@ void SkinTheme::load_ini_manifest(Skin& skin, StringView path)
     if (!name.is_empty())
         skin.name = name;
 
+    // [Skin] transparent_color=#ff00ff or 255,0,255. M4Player uses the same
+    // key (default 255,0,255) to punch holes in its 24-bit skin bitmaps.
+    auto key = config->read_entry("Skin"sv, "transparent_color"sv, ""sv);
+    if (key.is_empty())
+        key = config->read_entry("Skin"sv, "mask_color"sv, ""sv);
+    skin.transparent_color = parse_mask_color(key);
+
     // Colours: every key is optional and falls back to the classic palette.
     auto& c = skin.colors;
     auto color = [&](StringView key, Gfx::Color fallback) {
@@ -223,6 +306,7 @@ void SkinTheme::load_ini_manifest(Skin& skin, StringView path)
     c.panel_bottom = color("panel_bottom"sv, defaults.panel_bottom);
     c.inset_background = color("inset_bg"sv, defaults.inset_background);
     c.title_strip = color("title_strip"sv, defaults.title_strip);
+    c.title_text = color("title_text"sv, defaults.title_text);
     c.bevel_light = color("bevel_light"sv, defaults.bevel_light);
     c.bevel_mid = color("bevel_mid"sv, defaults.bevel_mid);
     c.bevel_dark = color("bevel_dark"sv, defaults.bevel_dark);
@@ -282,17 +366,87 @@ void SkinTheme::load_oop_manifest(Skin& skin, StringView path)
     if (!name.is_empty())
         skin.name = name;
 
-    auto layout_path = ByteString::formatted("{}/player_window.xml", skin.directory);
-    auto layout_file = Core::File::open(layout_path, Core::File::OpenMode::Read);
-    if (layout_file.is_error())
-        return;
-    auto layout_contents = layout_file.value()->read_until_eof();
-    if (layout_contents.is_error())
-        return;
-    StringView layout_text { reinterpret_cast<char const*>(layout_contents.value().data()), layout_contents.value().size() };
-    auto image = read_tag(layout_text, "image"sv);
-    if (!image.is_empty())
-        skin.main_background = load_bitmap(ByteString::formatted("{}/{}", skin.directory, image));
+    // M4Player declares the mask colour in Skin_OOP.xml; 255,0,255 is its
+    // documented default even when the tag is missing.
+    skin.transparent_color = parse_mask_color(read_tag(text, "transparent_color"sv));
+    if (!skin.transparent_color.has_value())
+        skin.transparent_color = Gfx::Color::from_rgb(0xff00ff);
+
+    // TT2OO converts each <panel> of an original 千千静听 skin.xml into one
+    // XRC file named after that panel. The root <object class="VdkWindow">
+    // carries the window <rect> (x,y,width,height - see TT2OO::Pos2Rect) and
+    // the backdrop <image>; child <object>s describe buttons/sliders and come
+    // later in the document, so the FIRST tag of each kind is the window one.
+    // Read all four panels, not just the main one: without their rects
+    // apply_skin_geometry() has nothing to work with and the sticky panels
+    // keep their old size/position, and without their images the player falls
+    // back to filename guessing.
+    struct Panel {
+        Optional<Gfx::IntRect> rect;
+        RefPtr<Gfx::Bitmap> bitmap;
+    };
+    auto load_panel = [&](Vector<StringView> names) -> Panel {
+        for (auto const& name : names) {
+            auto xrc_path = ByteString::formatted("{}/{}", skin.directory, name);
+            auto xrc = Core::File::open(xrc_path, Core::File::OpenMode::Read);
+            if (xrc.is_error())
+                continue;
+            auto bytes = xrc.value()->read_until_eof();
+            if (bytes.is_error())
+                continue;
+            StringView xrc_text { reinterpret_cast<char const*>(bytes.value().data()), bytes.value().size() };
+
+            Panel panel;
+            auto rect = read_tag(xrc_text, "rect"sv);
+            auto parts = StringView { rect }.split_view(',');
+            if (parts.size() == 4) {
+                int v[4];
+                for (size_t i = 0; i < 4; ++i)
+                    v[i] = parts[i].trim_whitespace().to_number<int>().value_or(0);
+                if (v[2] > 0 && v[3] > 0)
+                    panel.rect = Gfx::IntRect { v[0], v[1], v[2], v[3] };
+            }
+
+            auto image = read_tag(xrc_text, "image"sv);
+            if (image.is_empty())
+                image = read_tag(xrc_text, "bitmap"sv);
+            if (!image.is_empty()) {
+                // Windows-authored skins use backslashes and subdirectories.
+                StringBuilder normalized;
+                for (char c : image)
+                    normalized.append(c == '\\' ? '/' : c);
+                auto image_path = normalized.to_byte_string();
+                panel.bitmap = load_bitmap(ByteString::formatted("{}/{}", skin.directory, image_path));
+                if (!panel.bitmap)
+                    panel.bitmap = load_bitmap(ByteString::formatted("{}/{}", skin.directory, LexicalPath::basename(image_path)));
+            }
+            return panel; // first XRC that exists wins
+        }
+        return {};
+    };
+
+    auto main = load_panel({ "player_window.xml"sv });
+    auto playlist = load_panel({ "PlayList.xml"sv, "Playlist.xml"sv, "playlist.xml"sv });
+    auto lyrics = load_panel({ "Lyric.xml"sv, "Lyrics.xml"sv, "lyrics.xml"sv });
+    auto equalizer = load_panel({ "Eq.xml"sv, "Equalizer.xml"sv, "equalizer.xml"sv });
+
+    if (main.bitmap)
+        skin.main_background = main.bitmap;
+    if (playlist.bitmap)
+        skin.playlist_background = playlist.bitmap;
+    if (lyrics.bitmap)
+        skin.lyrics_background = lyrics.bitmap;
+    if (equalizer.bitmap)
+        skin.equalizer_background = equalizer.bitmap;
+
+    if (main.rect.has_value())
+        skin.geometry[0] = main.rect;
+    if (playlist.rect.has_value())
+        skin.geometry[1] = playlist.rect;
+    if (lyrics.rect.has_value())
+        skin.geometry[2] = lyrics.rect;
+    if (equalizer.rect.has_value())
+        skin.geometry[3] = equalizer.rect;
 }
 
 void SkinTheme::detect_backgrounds(Skin& skin)

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "SkinDocument.h"
 #include "TTSkin.h"
 #include <AK/RefPtr.h>
 #include <AK/ByteString.h>
@@ -20,13 +21,19 @@
 // use: one directory per skin holding a manifest plus background bitmaps.
 // Manifests understood, in order of preference:
 //
-//   skin.ini        [Skin] Name=/Author=, [Colors] ..., [Images] main=/playlist=/lyrics=/equalizer=
-//   Skin_OOP.xml    M4Player: <name>, backgrounds taken from player_window.xml <image>
+//   Skin.xml        NATIVE 千千静听 format (version 2): describes the windows
+//                   AND every control (rect / multi-frame bitmap / colours /
+//                   font). Parsed by SkinDocument, exposed via native_document().
+//   skin.ini        [Skin] Name=/Author=, [Colors] ..., [Images] ..., [Layout] ...
+//   Skin_OOP.xml    M4Player/TT2OO: <name> + <transparent_color>; each panel's
+//                   XRC (player_window.xml, PlayList.xml, Lyric.xml, Eq.xml)
+//                   supplies its <rect> geometry and backdrop <image>
 //   (none)          images auto-detected by filename (main.bmp, playlist.bmp, ...)
 //
 // A .tsk/.msk/.zip pack is extracted into the skins directory and then loaded
 // through the same path, so original 千千静听 skin packs can be dropped in
-// unchanged.
+// unchanged. Note that native `position` is two-point (l,t,r,b) while the
+// M4Player XRC `<rect>` is x,y,width,height.
 class SkinTheme {
 public:
     enum class WindowKind {
@@ -49,6 +56,15 @@ public:
         // This is the M4Player <rect> equivalent: a skin owns the shape of the
         // player, not just its palette.
         Optional<Gfx::IntRect> geometry[4];
+
+        // M4Player's <transparent_color>: the RGB that marks holes in the
+        // bitmap. Passed straight to WindowServer as a colour key.
+        Optional<Gfx::Color> transparent_color;
+
+        // Present only for native Skin.xml skins. This is the control-level
+        // layout; skin.ini / XRC skins leave it empty and keep using LibGUI
+        // widgets instead of a SkinCanvas.
+        Optional<SkinDocument> document;
 
         Optional<Gfx::IntRect> layout_for(WindowKind kind) const
         {
@@ -94,6 +110,10 @@ public:
     Gfx::Bitmap const* background(WindowKind) const;
     bool has_background(WindowKind) const;
     Optional<Gfx::IntRect> window_geometry(WindowKind) const;
+    Optional<Gfx::Color> transparent_color() const;
+
+    // Control-level layout for the current skin, or nullptr for classic skins.
+    SkinDocument const* native_document() const;
 
     // Extracts a .tsk/.msk/.zip pack (or registers a directory), then rescans.
     ErrorOr<ByteString> install_package(StringView path);

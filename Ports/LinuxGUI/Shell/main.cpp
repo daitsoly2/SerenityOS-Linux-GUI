@@ -21,6 +21,10 @@
 #include "TaskbarWindow.h"
 #include "AppCatalog.h"
 #include <AK/Debug.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <stdio.h>
+#include <unistd.h>
 #include <LibConfig/Client.h>
 #include <LibCore/EventLoop.h>
 #include <LibDesktop/Launcher.h>
@@ -35,8 +39,30 @@
 #include <signal.h>
 #include <sys/wait.h>
 
+// A crash here takes the whole desktop with it and used to be completely
+// silent: systemd only recorded "Deactivated successfully". Dump a backtrace
+// so the next report has something to work with.
+static void on_fatal_signal(int signo)
+{
+    void* frames[64];
+    int count = backtrace(frames, 64);
+    char header[128];
+    int header_length = snprintf(header, sizeof(header), "\nshell: fatal signal %d, backtrace:\n", signo);
+    if (header_length > 0)
+        (void)!write(STDERR_FILENO, header, static_cast<size_t>(header_length));
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    signal(signo, SIG_DFL);
+    raise(signo);
+}
+
 ErrorOr<int> serenity_main(Main::Arguments arguments)
 {
+    signal(SIGSEGV, on_fatal_signal);
+    signal(SIGBUS, on_fatal_signal);
+    signal(SIGFPE, on_fatal_signal);
+    signal(SIGILL, on_fatal_signal);
+    signal(SIGABRT, on_fatal_signal);
+
     auto app = TRY(GUI::Application::create(arguments));
 
     // Apps launched from the start menu (.desktop entries) are X11 clients:

@@ -49,6 +49,7 @@
 #include <fcitx/instance.h>
 #include <fcitx/text.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -148,21 +149,25 @@ void write_file(std::string const& path, std::string const& content)
 }
 
 class SerenityIME;
+struct ImeClient;
 
 // One Serenity window == one fcitx input context. The three *Impl overrides are
 // exactly the points where fcitx hands results back to a frontend.
 class SerenityInputContext final : public fcitx::InputContext {
 public:
-    SerenityInputContext(fcitx::InputContextManager& manager, std::string const& display, SerenityIME& ime)
+    SerenityInputContext(fcitx::InputContextManager& manager, std::string const& display, ImeClient& client)
         : fcitx::InputContext(manager, display)
-        , m_ime(ime)
+        , m_client(client)
     {
         created();
     }
 
     ~SerenityInputContext() override
     {
-        destroy();
+        // Do NOT call destroy() here: fcitx::InputContext's own destructor
+        // already does it, and destroy() asserts !destroyed_. Calling it twice
+        // aborts fcitx5 during AddonManager::unload, which is exactly the
+        // "Assertion `!d->destroyed_` failed" crash we kept seeing on exit.
     }
 
 protected:
@@ -175,7 +180,22 @@ protected:
     void updateClientSideUIImpl() override;
 
 private:
-    SerenityIME& m_ime;
+    ImeClient& m_client;
+};
+
+// One accepted socket connection. There used to be exactly one of these: the
+// socket accepted a new client by *dropping* the previous one, because the only
+// consumer was a focused TextEditor. The Wayland host bridge is now a second
+// consumer (it relays text into Linux clients), and it must be able to hold the
+// socket while a native Serenity app is also connected — so every connection
+// gets its own input context and its own read buffer.
+struct ImeClient {
+    SerenityIME* ime { nullptr };
+    int fd { -1 };
+    std::string read_buffer;
+    std::unique_ptr<fcitx::EventSourceIO> read_event;
+    std::unique_ptr<SerenityInputContext> context;
+    bool dead { false };
 };
 
 class SerenityIME final : public fcitx::AddonInstance {
@@ -193,19 +213,21 @@ public:
 
     ~SerenityIME() override
     {
-        // Do NOT run drop_client() here: it calls m_context->focusOut(), which
-        // dereferences the input context's focus group. During
-        // AddonManager::unload that group is already being torn down, so
-        // focusOut() segfaults and takes fcitx5 down with it - which in turn
-        // kills every GTK/Qt client whose IM module was connected to it
-        // (the "Linux app crashes when switching to Chinese" symptom).
-        // Just release the context and close our own sockets.
-        m_read_event.reset();
-        m_context.reset();
-        if (m_client_fd >= 0) {
-            ::close(m_client_fd);
-            m_client_fd = -1;
+        // Do NOT call focusOut() from here: it dereferences the input
+        // context's focus group. During AddonManager::unload that group is
+        // already being torn down, so focusOut() segfaults and takes fcitx5
+        // down with it - which in turn kills every GTK/Qt client whose IM
+        // module was connected to it (the "Linux app crashes when switching to
+        // Chinese" symptom). Just release the contexts and our sockets.
+        for (auto& client : m_clients) {
+            client->read_event.reset();
+            client->context.reset();
+            if (client->fd >= 0) {
+                ::close(client->fd);
+                client->fd = -1;
+            }
         }
+        m_clients.clear();
         if (m_server_fd >= 0) {
             ::close(m_server_fd);
             ::unlink(socket_path());
@@ -241,7 +263,7 @@ public:
             return;
         }
         ::chmod(path.c_str(), 0600);
-        ::listen(m_server_fd, 1);
+        ::listen(m_server_fd, 8);
 
         m_accept_event = m_manager->instance()->eventLoop().addIOEvent(
             m_server_fd, fcitx::IOEventFlag::In,
@@ -254,57 +276,70 @@ public:
 
     void accept_client()
     {
+        // Reap connections that died earlier; their event sources are already
+        // reset, so this is the only safe point to actually free them.
+        m_clients.erase(std::remove_if(m_clients.begin(), m_clients.end(),
+                            [](std::unique_ptr<ImeClient> const& client) { return client->dead; }),
+            m_clients.end());
+
         auto fd = ::accept4(m_server_fd, nullptr, nullptr, SOCK_CLOEXEC);
         if (fd < 0)
             return;
 
-        drop_client();
-        m_client_fd = fd;
-        m_read_buffer.clear();
-        fprintf(stderr, "serenityime: client connected\n");
+        auto client = std::make_unique<ImeClient>();
+        client->ime = this;
+        client->fd = fd;
+        auto* raw = client.get();
+        m_clients.push_back(std::move(client));
+        fprintf(stderr, "serenityime: client connected (fd=%d, %zu total)\n", fd, m_clients.size());
 
-        m_read_event = m_manager->instance()->eventLoop().addIOEvent(
-            m_client_fd, fcitx::IOEventFlag::In,
-            [this](fcitx::EventSourceIO*, int, fcitx::IOEventFlags) {
-                return read_client();
+        raw->read_event = m_manager->instance()->eventLoop().addIOEvent(
+            fd, fcitx::IOEventFlag::In,
+            [this, raw](fcitx::EventSourceIO*, int, fcitx::IOEventFlags) {
+                return this->read_client(raw);
             });
     }
 
-    void drop_client()
+    void drop_client(ImeClient* client)
     {
-        m_read_event.reset();
-        if (m_context) {
-            m_context->focusOut();
-            m_context.reset();
+        if (!client || client->dead)
+            return;
+        client->dead = true;
+        client->read_event.reset();
+        if (client->context) {
+            client->context->focusOut();
+            client->context.reset();
         }
-        if (m_client_fd >= 0) {
-            ::close(m_client_fd);
-            m_client_fd = -1;
-            fprintf(stderr, "serenityime: client gone\n");
+        if (client->fd >= 0) {
+            ::close(client->fd);
+            client->fd = -1;
         }
+        publish_status();
+        fprintf(stderr, "serenityime: client gone (%zu remaining)\n", m_clients.size());
     }
 
-    bool read_client()
+    bool read_client(ImeClient* client)
     {
         char buffer[4096];
-        auto count = ::read(m_client_fd, buffer, sizeof(buffer));
+        auto count = ::read(client->fd, buffer, sizeof(buffer));
         if (count <= 0) {
-            drop_client();
+            drop_client(client);
             return true;
         }
-        m_read_buffer.append(buffer, static_cast<size_t>(count));
+        client->read_buffer.append(buffer, static_cast<size_t>(count));
 
         size_t newline;
-        while ((newline = m_read_buffer.find('\n')) != std::string::npos) {
-            auto line = m_read_buffer.substr(0, newline);
-            m_read_buffer.erase(0, newline + 1);
-            handle_command(line);
+        while ((newline = client->read_buffer.find('\n')) != std::string::npos) {
+            auto line = client->read_buffer.substr(0, newline);
+            client->read_buffer.erase(0, newline + 1);
+            handle_command(client, line);
         }
         return true;
     }
 
-    void handle_command(std::string const& line)
+    void handle_command(ImeClient* client, std::string const& line)
     {
+        auto& m_context = client->context;
         auto space = line.find(' ');
         auto command = line.substr(0, space);
         auto rest = space == std::string::npos ? std::string {} : line.substr(space + 1);
@@ -312,7 +347,7 @@ public:
         if (command == "create") {
             if (!m_context) {
                 m_context = std::make_unique<SerenityInputContext>(
-                    m_manager->instance()->inputContextManager(), "serenity", *this);
+                    m_manager->instance()->inputContextManager(), "serenity", *client);
                 // An input context only picks up the current input method once
                 // it belongs to a focus group. Without this fcitx reports no
                 // current input method and keyEvent() always returns false,
@@ -340,7 +375,7 @@ public:
             // status so the taskbar indicator has real data.
             publish_methods();
             publish_status();
-            send("ok");
+            send(client, "ok");
             return;
         }
 
@@ -350,12 +385,12 @@ public:
                 m_context.reset();
             }
             publish_status();
-            send("ok");
+            send(client, "ok");
             return;
         }
 
         if (!m_context) {
-            send("err no-context");
+            send(client, "err no-context");
             return;
         }
 
@@ -416,13 +451,13 @@ public:
             unsigned sym = 0, states = 0;
             int release = 0;
             if (sscanf(rest.c_str(), "%u %u %d", &sym, &states, &release) != 3) {
-                send("err bad-key");
+                send(client, "err bad-key");
                 return;
             }
             fcitx::Key key { static_cast<fcitx::KeySym>(sym), fcitx::KeyStates { states } };
             fcitx::KeyEvent event { m_context.get(), key, release != 0, 0 };
             auto handled = m_context->keyEvent(event);
-            send(handled ? "handled 1" : "handled 0");
+            send(client, handled ? "handled 1" : "handled 0");
             return;
         }
 
@@ -440,26 +475,26 @@ public:
                 auto& panel_ = m_context->inputPanel();
                 if (auto candidates = panel_.candidateList(); candidates && idx < candidates->size())
                     candidates->candidate(idx).select(m_context.get());
-                emit_panel(m_context.get());
+                emit_panel(client);
                 publish_status();
             }
-            send("handled 0");
+            send(client, "handled 0");
             return;
         }
 
-        send("err unknown-command");
+        send(client, "err unknown-command");
     }
 
-    void send(std::string const& line)
+    void send(ImeClient* client, std::string const& line)
     {
-        if (m_client_fd < 0)
+        if (!client || client->fd < 0 || client->dead)
             return;
         auto payload = line + "\n";
         size_t written = 0;
         while (written < payload.size()) {
             // MSG_NOSIGNAL: the client may disappear between two updates.
             // A plain write() would raise SIGPIPE and take fcitx5 down with it.
-            auto result = ::send(m_client_fd, payload.data() + written, payload.size() - written, MSG_NOSIGNAL);
+            auto result = ::send(client->fd, payload.data() + written, payload.size() - written, MSG_NOSIGNAL);
             if (result < 0) {
                 if (errno == EINTR)
                     continue;
@@ -615,8 +650,8 @@ public:
 
     void switch_to(std::string const& unique_name)
     {
-        if (m_context)
-            m_manager->instance()->setCurrentInputMethod(m_context.get(), unique_name, false);
+        if (auto* context = focused_context())
+            m_manager->instance()->setCurrentInputMethod(context, unique_name, false);
         else
             m_manager->instance()->setCurrentInputMethod(unique_name);
     }
@@ -656,26 +691,28 @@ public:
 
     // --- pushed from the input context -------------------------------------
 
-    void emit_commit(std::string const& text)
+    void emit_commit(ImeClient* client, std::string const& text)
     {
-        send("commit " + hex_encode(text));
+        send(client, "commit " + hex_encode(text));
     }
 
-    void emit_delete(int offset, unsigned int size)
+    void emit_delete(ImeClient* client, int offset, unsigned int size)
     {
-        send("delete " + std::to_string(offset) + " " + std::to_string(size));
+        send(client, "delete " + std::to_string(offset) + " " + std::to_string(size));
     }
 
-    void emit_forward(fcitx::ForwardKeyEvent const& key)
+    void emit_forward(ImeClient* client, fcitx::ForwardKeyEvent const& key)
     {
-        send("forward " + std::to_string(static_cast<unsigned>(key.rawKey().sym()))
+        send(client, "forward " + std::to_string(static_cast<unsigned>(key.rawKey().sym()))
             + " " + std::to_string(key.rawKey().states().toInteger())
             + " " + std::to_string(key.isRelease() ? 1 : 0));
     }
 
-    void emit_panel(fcitx::InputContext* context)
+    void emit_panel(ImeClient* client)
     {
-        auto const& panel = context->inputPanel();
+        if (!client || !client->context)
+            return;
+        auto const& panel = client->context->inputPanel();
         auto preedit = panel.clientPreedit();
         if (preedit.empty())
             preedit = panel.preedit();
@@ -688,7 +725,7 @@ public:
         auto candidates = panel.candidateList();
         if (!candidates) {
             line += " -1 0 0 0";
-            send(line);
+            send(client, line);
             return;
         }
 
@@ -705,17 +742,25 @@ public:
         auto* pageable = candidates->toPageable();
         line += " " + std::to_string(pageable && pageable->hasPrev() ? 1 : 0);
         line += " " + std::to_string(pageable && pageable->hasNext() ? 1 : 0);
-        send(line);
+        send(client, line);
     }
 
 private:
     fcitx::AddonManager* m_manager { nullptr };
     int m_server_fd { -1 };
-    int m_client_fd { -1 };
-    std::string m_read_buffer;
     std::unique_ptr<fcitx::EventSourceIO> m_accept_event;
-    std::unique_ptr<fcitx::EventSourceIO> m_read_event;
-    std::unique_ptr<SerenityInputContext> m_context;
+    std::vector<std::unique_ptr<ImeClient>> m_clients;
+
+    // The input context that currently has focus, if any. The control socket
+    // (taskbar indicator) needs it to switch input method per context.
+    fcitx::InputContext* focused_context()
+    {
+        for (auto& client : m_clients) {
+            if (client->context && client->context->hasFocus())
+                return client->context.get();
+        }
+        return nullptr;
+    }
 
     // --- status publishing + control socket ------------------------------
     //
@@ -741,27 +786,27 @@ private:
 
 void SerenityInputContext::commitStringImpl(std::string const& text)
 {
-    m_ime.emit_commit(text);
+    m_client.ime->emit_commit(&m_client, text);
 }
 
 void SerenityInputContext::deleteSurroundingTextImpl(int offset, unsigned int size)
 {
-    m_ime.emit_delete(offset, size);
+    m_client.ime->emit_delete(&m_client, offset, size);
 }
 
 void SerenityInputContext::forwardKeyImpl(fcitx::ForwardKeyEvent const& key)
 {
-    m_ime.emit_forward(key);
+    m_client.ime->emit_forward(&m_client, key);
 }
 
 void SerenityInputContext::updatePreeditImpl()
 {
-    m_ime.emit_panel(this);
+    m_client.ime->emit_panel(&m_client);
 }
 
 void SerenityInputContext::updateClientSideUIImpl()
 {
-    m_ime.emit_panel(this);
+    m_client.ime->emit_panel(&m_client);
 }
 
 class SerenityIMEFactory final : public fcitx::AddonFactory {

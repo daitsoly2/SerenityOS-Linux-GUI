@@ -91,7 +91,8 @@ private:
     ByteString status_line() const;
 
     // ── capture ─────────────────────────────────────────────────────────────
-    bool open_capture_stream();
+    bool open_capture_stream(int width, int height);
+    bool open_local_encoder(int width, int height);
     void close_capture_stream();
     void on_frame_tick();
     void pump_pending_frame();
@@ -116,6 +117,9 @@ private:
     u64 m_accumulated_ms { 0 };
 
     int m_capture_fd { -1 };
+    // Local transport: ffmpeg child fed through a pipe (the gsr model).
+    int m_encoder_pid { -1 };
+    bool m_local_encoder { false };
     Vector<u8> m_frame_buffer;
     RefPtr<Gfx::Bitmap> m_scaled_frame;
     size_t m_frame_size { 0 };

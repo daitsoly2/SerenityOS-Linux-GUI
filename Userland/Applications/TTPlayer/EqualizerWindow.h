@@ -65,9 +65,11 @@ private:
     EqualizerWindow(NonnullRefPtr<PlayerCore>, Gfx::IntPoint fallback_position);
 
     void build_ui();
+    void push_eq_to_canvas();
 
     NonnullRefPtr<PlayerCore> m_core;
     RefPtr<SkinButton> m_enable_button;
     RefPtr<EqBandSlider> m_preamp;
     Vector<NonnullRefPtr<EqBandSlider>> m_bands;
+    class SkinPanel* m_panel { nullptr };
 };

@@ -392,6 +392,20 @@ void Window::set_has_alpha_channel(bool value)
     Compositor::the().invalidate_occlusions();
 }
 
+void Window::set_transparent_color(Optional<Gfx::Color> const& color)
+{
+    if (m_transparent_color == color)
+        return;
+    m_transparent_color = color;
+    // A colour-keyed window is no longer fully opaque: the occlusion and
+    // transparency rectangle sets have to be rebuilt. A full invalidate is
+    // also required: blit_filtered() skips key pixels instead of writing
+    // transparent ones, so any stale key-coloured pixel from the previous
+    // frame would otherwise stay on screen.
+    Compositor::the().invalidate_occlusions();
+    invalidate(true, true);
+}
+
 void Window::set_occluded(bool occluded)
 {
     if (m_occluded == occluded)
@@ -1092,13 +1106,25 @@ Optional<HitTestResult> Window::hit_test(Gfx::IntPoint position, bool include_fr
     }
     bool hit = false;
     u8 threshold = alpha_hit_threshold() * 255;
-    if (threshold == 0 || !m_backing_store || !m_backing_store->has_alpha_channel()) {
+
+    // Colour-key skins have no alpha channel in the source bitmap, so a single
+    // opaque RGB marks the holes. Read the backing pixel once and let the key
+    // take precedence over the alpha threshold.
+    Gfx::Color pixel { Gfx::Color::Transparent };
+    bool have_pixel = false;
+    if (m_backing_store) {
+        auto relative_point = position.translated(-rect().location()) * m_backing_store->scale();
+        if (m_backing_store->rect().contains(relative_point)) {
+            pixel = m_backing_store->get_pixel(relative_point);
+            have_pixel = true;
+        }
+    }
+    if (have_pixel && matches_transparent_color(pixel)) {
+        hit = false;
+    } else if (threshold == 0 || !m_backing_store || !m_backing_store->has_alpha_channel()) {
         hit = true;
     } else {
-        auto relative_point = position.translated(-rect().location()) * m_backing_store->scale();
-        u8 alpha = 0xff;
-        if (m_backing_store->rect().contains(relative_point))
-            alpha = m_backing_store->get_pixel(relative_point).alpha();
+        u8 alpha = have_pixel ? pixel.alpha() : 0xff;
         hit = alpha >= threshold;
     }
     if (!hit)

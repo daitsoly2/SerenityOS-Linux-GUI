@@ -83,6 +83,13 @@ struct wlroots_proto_callbacks {
         int sub_x, int sub_y);
     void (*subsurface_repositioned)(void* user, void* subsurface);
     void (*subsurface_destroyed)(void* user, void* subsurface);
+
+    /*
+     * 已获得焦点的 text_input 提交了新状态（光标矩形/surrounding text 等）。
+     * 内置输入法要靠它把候选窗重新定位到光标下方。surface 非 NULL 表示
+     * 该 surface 所属客户端当前持有文本输入焦点。
+     */
+    void (*text_input_state_changed)(void* user, void* surface);
 };
 
 /* socket_name 为空时用 wayland-serenity-0（与 serenitid 导出的名字一致）。
@@ -156,6 +163,24 @@ void wlroots_proto_subsurface_offset(wlroots_proto*, void* subsurface, int* x, i
 /* 取某 toplevel surface 的 window_geometry 偏移（CSD 阴影厚度），用于把
  * subsurface 的父-buffer 坐标换算到窗口内容区坐标。 */
 void wlroots_proto_toplevel_geometry_offset(wlroots_proto*, void* surface, int* gx, int* gy);
+
+/* ── 内置输入法（text-input-v3 前端）─────────────────────────────────────── *
+ * 桥现在自己就是「输入法前端」：客户端通过 text_input_v3 声明要输文本，
+ * 桥把按键交给引擎（serenityime socket → fcitx5 的 rime 等），再把上屏文本
+ * 用 commit_string 回灌；候选窗由桥用 LibGUI 画（Serenity 外观）。
+ *
+ * 因此 input-method-v2（让 fcitx5 自己当 IM、自己弹候选窗）默认**不启用**，
+ * 需要时用环境变量 SERENITY_IM_V2=1 打开做对照实验。
+ */
+/* 当前是否有客户端持有文本输入焦点。 */
+int wlroots_proto_text_input_active(wlroots_proto*);
+/* 焦点 text_input 报告的光标矩形（surface 坐标，可能全 0）。 */
+void wlroots_proto_text_input_cursor_rect(wlroots_proto*, int* x, int* y, int* w, int* h);
+/* 上屏：commit_string + done。 */
+void wlroots_proto_text_input_commit(wlroots_proto*, char const* text);
+void wlroots_proto_text_input_preedit(wlroots_proto*, char const* text, int cursor_begin, int cursor_end);
+void wlroots_proto_text_input_delete(wlroots_proto*, unsigned before_length, unsigned after_length);
+void wlroots_proto_text_input_done(wlroots_proto*);
 
 #ifdef __cplusplus
 }

@@ -135,4 +135,13 @@ private:
     Gfx::IntRect m_cursor_rect;
 };
 
+// fcitx5 风格的 X11 keysym 换算。桥内建输入法（serenity-wlroots-host）自己没有
+// TextEditor，但需要和原生应用**完全一致**的 key→keysym 映射，否则同一个键在
+// GTK 应用和 Serenity 应用里会被引擎解释成不同的字符。
+u32 ime_keysym_for_key_event(KeyEvent const&);
+// keysym → KeyCode（用于引擎要求「把这个键还给应用」时反向还原）。
+// 名字带 ime_ 前缀：InputMethod.cpp 内部已有一个同签名的静态辅助函数，
+// 直接叫 keysym_to_key_code 会让那个文件里的调用点二义。
+KeyCode ime_key_code_for_keysym(u32 keysym, u32& code_point);
+
 }

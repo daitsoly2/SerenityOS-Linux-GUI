@@ -21,6 +21,7 @@
 #include <LibGUI/Process.h>
 #include <LibGUI/Window.h>
 #include <LibGfx/Bitmap.h>
+#include <Ports/LinuxGUI/Common/AppIcons.h>
 #include <Ports/LinuxGUI/Common/Translation.h>
 #include <Ports/LinuxGUI/Common/hostify.h>
 
@@ -166,12 +167,9 @@ bool set_category(ByteString const& path, ByteString const& category)
 
 static RefPtr<Gfx::Bitmap const> load_icon(ByteString const& path)
 {
-    if (path.is_empty())
-        return nullptr;
-    auto bitmap = Gfx::Bitmap::load_from_file(path);
-    if (bitmap.is_error())
-        return nullptr;
-    return bitmap.release_value();
+    // A shortcut may store a path, a freedesktop theme name or an .exe; the
+    // shared resolver understands all three and caches the decoded bitmap.
+    return PortIcons::resolve(path, 16);
 }
 
 static void refresh()

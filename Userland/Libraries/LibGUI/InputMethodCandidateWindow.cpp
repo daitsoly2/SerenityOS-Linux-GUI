@@ -34,8 +34,14 @@ Gfx::IntSize InputMethodPanelWidget::preferred_size() const
     int const line_height = static_cast<int>(font().preferred_line_height()) + 6;
     auto measure = [&](StringView s) { return static_cast<int>(font().width(s)); };
 
+    /* 双行：第一行拼音 preedit（+ 引擎给的 aux），第二行候选。
+     * 单行时拼音和候选挤在一起，preedit 会被候选挤没（历史上干脆被删掉过），
+     * 这里恢复成经典输入法的两行观感。 */
+    bool const two_line = !m_preedit.is_empty();
+    int const preedit_row_height = two_line ? line_height : 0;
+
     int width = 10; // 左右内边距（含 2px 阴影预留）
-    if (!m_aux.is_empty())
+    if (!m_aux.is_empty() && !two_line)
         width += measure(m_aux.bytes_as_string_view()) + 10;
 
     for (size_t i = 0; i < m_texts.size(); ++i) {
@@ -46,7 +52,15 @@ Gfx::IntSize InputMethodPanelWidget::preferred_size() const
     if (m_has_prev || m_has_next)
         width += 30;
 
-    return { max(width, 48), line_height + 4 }; // +4: 上边 1px + 下边 2px 阴影 + 余量
+    if (two_line) {
+        /* 拼音行的宽度：和候选行共用同一个左起点（见 paint_event 的 preedit_x）。 */
+        int preedit_row = 11 + measure(m_preedit.bytes_as_string_view()) + 8;
+        if (!m_aux.is_empty())
+            preedit_row += measure(m_aux.bytes_as_string_view()) + 6;
+        width = max(width, preedit_row);
+    }
+
+    return { max(width, 48), line_height + preedit_row_height + 4 }; // +4: 上边 1px + 下边 2px 阴影 + 余量
 }
 
 InputMethodPanelWidget::RowLayout InputMethodPanelWidget::compute_layout() const
@@ -54,22 +68,27 @@ InputMethodPanelWidget::RowLayout InputMethodPanelWidget::compute_layout() const
     RowLayout layout;
     int const line_height = static_cast<int>(font().preferred_line_height()) + 6;
 
+    bool const two_line = !m_preedit.is_empty();
+    int const row_y = two_line ? line_height + 1 : 1;
+
+    /* 双行时 aux 画在第一行（拼音后面），候选行必须从最左边开始，
+     * 否则第二行整体右移一段，和拼音左边缘对不齐。 */
     int x = 4;
-    if (!m_aux.is_empty())
+    if (!m_aux.is_empty() && !two_line)
         x += static_cast<int>(font().width(m_aux.bytes_as_string_view())) + 10;
 
     for (size_t i = 0; i < m_texts.size(); ++i) {
         StringView label = i < m_labels.size() ? m_labels[i].bytes_as_string_view() : ""sv;
         int const item_width = static_cast<int>(font().width(label)) + 6
             + static_cast<int>(font().width(m_texts[i].bytes_as_string_view())) + 14;
-        layout.candidate_rows.append(Gfx::IntRect { x, 1, item_width, line_height });
+        layout.candidate_rows.append(Gfx::IntRect { x, row_y, item_width, line_height });
         x += item_width;
     }
 
     if (m_has_prev || m_has_next) {
         layout.has_pager = true;
-        layout.prev_rect = Gfx::IntRect { x + 2, 1, 13, line_height };
-        layout.next_rect = Gfx::IntRect { x + 15, 1, 13, line_height };
+        layout.prev_rect = Gfx::IntRect { x + 2, row_y, 13, line_height };
+        layout.next_rect = Gfx::IntRect { x + 15, row_y, 13, line_height };
     }
 
     return layout;
@@ -105,9 +124,23 @@ void InputMethodPanelWidget::paint_event(PaintEvent& event)
 
     int const line_height = static_cast<int>(font().preferred_line_height()) + 6;
 
-    // aux（音节/声调提示，如有）压缩到候选条最左侧；拼音 preedit 已改到编辑器
-    // 输入区光标处内联绘制（见 README §内联预编辑），候选窗不再重复画拼音。
-    int x = 6;
+    /* 第一行：拼音 preedit（带内联光标）。aux（首选词预览）跟在它后面用弱色。
+     * 以前这一行被删掉、指望在编辑器里内联绘制拼音，但那条路没实现，
+     * 结果就是「打字看不到拼音」。 */
+    /* 11 = 候选行 label 的绘制起点（row.x()+7，row.x()==4），保证两行左对齐。 */
+    int x = 11;
+    if (!m_preedit.is_empty()) {
+        auto preedit = m_preedit.bytes_as_string_view();
+        int const w = static_cast<int>(font().width(preedit));
+        painter.draw_text(Gfx::IntRect { x, 1, w, line_height }, preedit,
+            Gfx::TextAlignment::CenterLeft, text_normal);
+
+        /* 内联光标：m_preedit_cursor 是字符下标，按前缀宽度定位。 */
+        int const cursor_index = clamp(m_preedit_cursor, 0, static_cast<int>(preedit.length()));
+        int const caret_x = x + static_cast<int>(font().width(preedit.substring_view(0, cursor_index)));
+        painter.fill_rect(Gfx::IntRect { caret_x, 3, 1, line_height - 6 }, text_normal);
+        x += w + 6;
+    }
     if (!m_aux.is_empty()) {
         auto aux = m_aux.bytes_as_string_view();
         int const w = static_cast<int>(font().width(aux));

@@ -92,10 +92,15 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
     bool is_desktop_mode { false };
     bool is_selection_mode { false };
     bool ignore_path_resolution { false };
+    ByteString properties_path;
     ByteString initial_location;
     args_parser.add_option(is_desktop_mode, "Run in desktop mode", "desktop", 'd');
     args_parser.add_option(is_selection_mode, "Show entry in parent folder", "select", 's');
     args_parser.add_option(ignore_path_resolution, "Use raw path, do not resolve real path", "raw", 'r');
+    // Standalone properties window, used by the desktop shell's "属性" menu
+    // entry: it opens the real dialog instead of dumping the user into the
+    // system Settings app.
+    args_parser.add_option(properties_path, "Show the properties window for this path and nothing else", "properties", 'p', "path");
     args_parser.add_positional_argument(initial_location, "Path to open", "path", Core::ArgsParser::Required::No);
     args_parser.parse(arguments);
 
@@ -109,6 +114,19 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
 
     if (is_desktop_mode)
         return run_in_desktop_mode();
+
+    // "属性" from a desktop icon: the dialog is a top-level window of its own,
+    // so the app is just this one window and exits when it closes.
+    if (!properties_path.is_empty()) {
+        // Bind to a const lvalue so overload resolution picks the declared
+        // try_create(path, disable_rename) instead of C_OBJECT's forwarding
+        // template, which would try to construct with a bool as the parent.
+        ByteString const path = properties_path;
+        auto properties = TRY(PropertiesWindow::try_create(path, true));
+        properties->center_on_screen();
+        properties->show();
+        return app->exec();
+    }
 
     // our initial location is defined as, in order of precedence:
     // 1. the command-line path argument (e.g. FileManager /bin)
@@ -616,9 +634,14 @@ ErrorOr<int> run_in_windowed_mode(ByteString const& initial_location, ByteString
     directory_view->set_name("directory_view");
     directory_view->set_preferred_width(GUI::SpecialDimension::Grow);
 
+    // A fixed-width preview pane is useless for photos, so a 5px strip between
+    // the list and the pane trades width between them (drag left = wider pane).
+    auto preview_splitter = TRY(content_host.try_add<ExplorerSplitterHandle>());
+    preview_splitter->set_fixed_width(5);
+    preview_splitter->set_visible(false);
+
     auto preview_pane = TRY(content_host.try_add<ExplorerPreviewPane>());
     preview_pane->set_fill_with_background_color(true);
-    preview_pane->set_fixed_width(190);
     preview_pane->set_visible(false);
 
     statusbar_host.set_layout<GUI::HorizontalBoxLayout>(GUI::Margins {}, 0);
@@ -643,6 +666,23 @@ ErrorOr<int> run_in_windowed_mode(ByteString const& initial_location, ByteString
     bool show_statusbar = Config::read_bool("FileManager"sv, "Layout"sv, "ShowStatusbar"sv, true);
     bool show_command_bar = Config::read_bool("FileManager"sv, "Layout"sv, "ShowCommandBar"sv, true);
 
+    // Preview pane width is user-resizable and remembered across sessions.
+    int preview_pane_width = max(160, static_cast<int>(Config::read_i32("FileManager"sv, "Layout"sv, "PreviewPaneWidth"sv, 260)));
+    preview_pane->set_fixed_width(preview_pane_width);
+    int preview_drag_origin_width = preview_pane_width;
+    preview_splitter->on_drag_start = [&] {
+        preview_drag_origin_width = preview_pane->width();
+    };
+    preview_splitter->on_drag = [&](int delta) {
+        // Keep at least 260px for the file list so the pane cannot swallow it.
+        int max_width = max(200, content_host.width() - 260);
+        preview_pane->set_fixed_width(clamp(preview_drag_origin_width - delta, 160, max_width));
+    };
+    preview_splitter->on_drag_finished = [&] {
+        preview_pane_width = preview_pane->width();
+        Config::write_i32("FileManager"sv, "Layout"sv, "PreviewPaneWidth"sv, preview_pane_width);
+    };
+
     auto apply_hidden_files = [&](bool show) {
         show_hidden_files = show;
         directory_view->set_should_show_dotfiles(show);
@@ -657,6 +697,7 @@ ErrorOr<int> run_in_windowed_mode(ByteString const& initial_location, ByteString
     auto apply_preview_pane = [&](bool show) {
         show_preview_pane = show;
         preview_pane->set_visible(show);
+        preview_splitter->set_visible(show);
         statusbar->view_switcher().set_preview_visible(show);
         Config::write_bool("FileManager"sv, "Layout"sv, "ShowPreviewPane"sv, show);
     };

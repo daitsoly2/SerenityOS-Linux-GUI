@@ -8,6 +8,7 @@
 #include <AK/QuickSort.h>
 #include <AK/StringBuilder.h>
 #include <LibFileSystem/FileSystem.h>
+#include <Ports/LinuxGUI/Common/AppIcons.h>
 #include <Ports/LinuxGUI/Common/WinApps.h>
 #include <Ports/LinuxGUI/Common/hostify.h>
 #include <unistd.h>
@@ -123,10 +124,13 @@ RefPtr<Gfx::Bitmap const> AppCatalog::icon_for(Desktop::AppFile const& app, int 
     if (auto it = m_icons.find(key); it != m_icons.end())
         return it->value;
 
-    auto icon = app.icon();
-    auto bitmap = retain_bitmap(icon.bitmap_for_size(size));
-    if (!bitmap && !app.icon_path().is_empty())
-        bitmap = icon_for_path(app.icon_path(), size);
+    // Icon= may be an absolute path, a freedesktop theme name or a Windows
+    // executable; PortIcons resolves all three (and caches the decode).
+    auto bitmap = icon_for_path(app.icon_path(), size);
+    if (!bitmap) {
+        auto icon = app.icon();
+        bitmap = retain_bitmap(icon.bitmap_for_size(size));
+    }
 
     m_icons.set(key, bitmap);
     return bitmap;
@@ -141,18 +145,9 @@ RefPtr<Gfx::Bitmap const> AppCatalog::icon_for_path(ByteString const& path, int 
     if (auto it = m_icons.find(key); it != m_icons.end())
         return it->value;
 
-    RefPtr<Gfx::Bitmap const> bitmap;
-    if (auto loaded = Gfx::Bitmap::load_from_file(path, 1); !loaded.is_error()) {
-        auto full = loaded.release_value();
-        if (full->width() == size && full->height() == size) {
-            bitmap = full;
-        } else if (auto scaled = full->scaled(size / static_cast<float>(full->width()), size / static_cast<float>(full->height())); !scaled.is_error()) {
-            // Shortcut icons are 32x32 on disk; scale once instead of on every paint.
-            bitmap = scaled.release_value();
-        } else {
-            bitmap = full;
-        }
-    }
+    // Handles absolute paths, .ico, freedesktop theme names (PNG or SVG) and
+    // Windows executables; scales to `size` once instead of on every paint.
+    auto bitmap = PortIcons::resolve(path, size);
 
     m_icons.set(key, bitmap);
     return bitmap;

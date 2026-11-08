@@ -27,7 +27,9 @@
 #include <LibGfx/Palette.h>
 #include <LibGfx/SystemTheme.h>
 #include <LibMain/Main.h>
+#include <execinfo.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/stat.h>
@@ -225,6 +227,25 @@ static volatile sig_atomic_t s_screenshot_requested { 0 };
 static void on_termination_signal(int)
 {
     s_quit_requested = 1;
+}
+
+// A crash in the compositor takes the entire desktop with it, and without a
+// handler the segfault is completely silent: the session manager only records
+// "window-server exited (signal 11)" and the backtrace is lost. Dump one to
+// stderr before dying so the next report has something to work with.
+static void on_fatal_signal(int signo)
+{
+    void* frames[64];
+    int count = backtrace(frames, 64);
+    char header[128];
+    int header_length = snprintf(header, sizeof(header), "\nWindowServer: fatal signal %d, backtrace:\n", signo);
+    if (header_length > 0)
+        (void)!write(STDERR_FILENO, header, static_cast<size_t>(header_length));
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
+    // Restore the default action and re-raise so the exit status still says
+    // "killed by signal" (the session manager and systemd rely on it).
+    signal(signo, SIG_DFL);
+    raise(signo);
 }
 
 static bool using_sdl_presenter()
@@ -638,6 +659,12 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
 
     signal(SIGINT, on_termination_signal);
     signal(SIGTERM, on_termination_signal);
+
+    signal(SIGSEGV, on_fatal_signal);
+    signal(SIGBUS, on_fatal_signal);
+    signal(SIGFPE, on_fatal_signal);
+    signal(SIGILL, on_fatal_signal);
+    signal(SIGABRT, on_fatal_signal);
 
     signal(SIGUSR1, [](int) { s_screenshot_requested = 1; });
 

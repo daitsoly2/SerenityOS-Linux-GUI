@@ -5,6 +5,12 @@
 # of the "/bin/Name" -> "serenity-<kebab-case>" launch rule, and the session
 # manager only has to supervise a single binary.
 
+# The shell owns the Linux tray protocol (org.kde.StatusNotifierWatcher) and
+# talks to it over libdbus. The parent directory already imports dbus-1 for the
+# compositor, but imported targets are scoped to the directory that created
+# them, so ask for it here as well.
+pkg_check_modules(DBUS_SHELL REQUIRED IMPORTED_TARGET dbus-1)
+
 set(TASKBAR_DIR "${SERENITY_PROJECT_ROOT}/Userland/Services/Taskbar")
 
 add_executable(serenity-shell
@@ -14,6 +20,9 @@ add_executable(serenity-shell
     StartMenuShortcuts.cpp
     StartMenuOverrides.cpp
     SystemMenu.cpp
+    StatusNotifierWatcher.cpp
+    TrayWidget.cpp
+    TrayAreaWidget.cpp
     ${TASKBAR_DIR}/ClockWidget.cpp
     ${TASKBAR_DIR}/QuickLaunchWidget.cpp
     ${TASKBAR_DIR}/ShutdownDialog.cpp
@@ -39,6 +48,7 @@ add_dependencies(serenity-shell
 target_include_directories(serenity-shell PRIVATE ${TASKBAR_DIR} ${SERENITY_PROJECT_ROOT}/Ports/LinuxGUI/IMEFrontend)
 
 target_link_libraries(serenity-shell PRIVATE
+    PkgConfig::DBUS_SHELL
     LibCore
     LibGfx
     LibGUI

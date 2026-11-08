@@ -167,6 +167,35 @@ public:
         m_alpha_hit_threshold = threshold;
     }
 
+    // Colour-key transparency for bitmap skins: a client can declare one RGB
+    // value as "transparent". The compositor filters it out of the backing
+    // store and hit testing treats those pixels as click-through, even though
+    // the source bitmap has no alpha channel.
+    Optional<Gfx::Color> const& transparent_color() const { return m_transparent_color; }
+    void set_transparent_color(Optional<Gfx::Color> const&);
+
+    // Tool windows (a player's playlist / lyrics / equalizer panels) are real
+    // top-level windows but must not get a taskbar button: the user asked for
+    // one entry per application, the way 千千静听 behaves on Windows.
+    bool skip_taskbar() const { return m_skip_taskbar; }
+    void set_skip_taskbar(bool skip) { m_skip_taskbar = skip; }
+
+    // Skin bitmaps are 24-bit and get resampled when the window size does not
+    // match; antialiased glyphs drawn over a hole blend with it too. A exact
+    // RGB comparison (or a tight +/-24) leaves a magenta fringe: measured
+    // residue on the shaped skin was #ff00ff -> (183,26,207), i.e. up to 72
+    // off on a single channel. Use a generous per-channel tolerance instead.
+    // Blue skin gradients cannot be caught by accident: their green channel
+    // is >200 while the key's is 0, far beyond this tolerance.
+    bool matches_transparent_color(Gfx::Color pixel) const
+    {
+        if (!m_transparent_color.has_value() || pixel.alpha() == 0)
+            return false;
+        auto key = *m_transparent_color;
+        auto near = [](u8 a, u8 b) { return (a > b ? a - b : b - a) <= 96; };
+        return near(pixel.red(), key.red()) && near(pixel.green(), key.green()) && near(pixel.blue(), key.blue());
+    }
+
     Optional<HitTestResult> hit_test(Gfx::IntPoint, bool include_frame = true);
 
     int x() const { return m_rect.x(); }
@@ -446,6 +475,8 @@ private:
     int m_window_id { -1 };
     i32 m_client_id { -1 };
     float m_alpha_hit_threshold { 0.0f };
+    Optional<Gfx::Color> m_transparent_color;
+    bool m_skip_taskbar { false };
     Gfx::IntSize m_size_increment;
     Gfx::IntSize m_base_size;
     Gfx::IntSize m_minimum_size { 0, 0 };

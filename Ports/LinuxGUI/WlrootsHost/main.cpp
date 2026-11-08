@@ -32,7 +32,11 @@
 #include <LibGUI/Desktop.h>
 #include <LibGUI/Event.h>
 #include <LibGUI/Window.h>
+#include <LibGUI/InputMethod.h>
 #include <LibMain/Main.h>
+
+#include "ImeService.h"
+#include "XimServer.h"
 
 #include <drm_fourcc.h>
 #include <stdio.h>
@@ -187,6 +191,92 @@ static int serenity_key_to_evdev(unsigned key)
     return -1;
 }
 
+/* ── 内建输入法：与 surface/focus 相关的小工具 ─────────────────────────── */
+
+/* 当前拥有文本输入焦点的 surface（用于判定是否要给 ImeService 转焦点）。 */
+static void* s_ime_surface { nullptr };
+
+/* LibGUI 的修饰位 → fcitx5/X11 KeyState 位（Shift=1, Ctrl=4, Alt=8, Super=64）。 */
+static unsigned ime_states_from_modifiers(u8 modifiers)
+{
+    unsigned states = 0;
+    if (modifiers & Mod_Shift)
+        states |= 1u << 0;
+    if (modifiers & Mod_Ctrl)
+        states |= 1u << 2;
+    if (modifiers & Mod_Alt)
+        states |= 1u << 3;
+    if (modifiers & Mod_Super)
+        states |= 1u << 6;
+    if (modifiers & Mod_AltGr)
+        states |= 1u << 7;
+    return states;
+}
+
+/* 键盘焦点离开宿主窗口：先把引擎的 context 收掉，再清 seat 焦点。 */
+static void host_keyboard_leave()
+{
+    if (s_ime_surface) {
+        s_ime_surface = nullptr;
+        /* XIM 客户端正拿着输入焦点时，Wayland 窗口失焦不能把引擎 reset：
+         * 两条前端共用一条 serenity-ime 连接，focus 0 会清掉正在进行的组字。 */
+        if (!XimServer::is_active())
+            ImeService::focus_out();
+    }
+    XimServer::set_ws_x11_focus(false);
+    wlroots_proto_keyboard_leave(s_proto);
+}
+
+/* 把引擎的上屏/删除/回退按键翻译成前端动作（Wayland 侧用 text_input_v3；
+ * 以后 XIM 前端复用同一批回调，只换发送端）。 */
+static void setup_ime_service()
+{
+    ImeService::set_on_commit([](String const& text) {
+        auto bytes = text.to_byte_string();
+        /* XIM 客户端没有 text_input_v3 对象，active() 恒为 0。
+         * 这个分流必须在 Wayland 的 active guard 之前，否则 XIM 的上屏
+         * 会被直接丢掉（日志里看得到 commit，文档里却什么都没有）。 */
+        if (XimServer::is_active()) {
+            XimServer::commit(bytes.characters());
+            return;
+        }
+        if (!s_proto || !wlroots_proto_text_input_active(s_proto))
+            return;
+        wlroots_proto_text_input_commit(s_proto, bytes.characters());
+        /* 上屏后清掉预编辑，再 done 一次把两件事一起提交。 */
+        wlroots_proto_text_input_preedit(s_proto, "", 0, 0);
+        wlroots_proto_text_input_done(s_proto);
+    });
+
+    ImeService::set_on_delete([](int offset, int size) {
+        if (!s_proto || size <= 0)
+            return;
+        /* text_input_v3 只有「光标前/后各删多少」；offset 为负表示光标前。 */
+        unsigned before = 0;
+        unsigned after = 0;
+        if (offset < 0) {
+            before = static_cast<unsigned>(AK::min(size, -offset));
+            after = static_cast<unsigned>(size) - before;
+        } else {
+            after = static_cast<unsigned>(size);
+        }
+        wlroots_proto_text_input_delete(s_proto, before, after);
+        wlroots_proto_text_input_done(s_proto);
+    });
+
+    ImeService::set_on_forward_key([](unsigned keysym, unsigned, bool release) {
+        if (!s_proto)
+            return;
+        u32 code_point = 0;
+        auto key = GUI::ime_key_code_for_keysym(keysym, code_point);
+        auto evdev = serenity_key_to_evdev(static_cast<unsigned>(key));
+        if (evdev < 0)
+            return;
+        /* 原样转发一次：引擎对同一物理键会分别 forward press 与 release。 */
+        wlroots_proto_keyboard_key(s_proto, static_cast<uint32_t>(evdev), !release, now_msec(), 0);
+    });
+}
+
 /* Serenity 的 MouseButton 是位标志；seat 要的是 Linux evdev 按钮码。 */
 static uint32_t linux_button(GUI::MouseButton button)
 {
@@ -321,6 +411,21 @@ private:
         GUI::Widget::keydown_event(event);
         if (!m_surface)
             return;
+        fprintf(stderr, "host: keydown surf=%p ti_active=%d key=0x%x cp=%d keysym=%u\n",
+            m_surface, wlroots_proto_text_input_active(s_proto),
+            static_cast<unsigned>(event.key()), event.code_point(),
+            GUI::ime_keysym_for_key_event(event));
+        /* 内建输入法优先：客户端声明了文本输入焦点时，键先给引擎。
+         * 引擎消费（组字、选词、翻页）就吞掉，绝不重复发给客户端。 */
+        if (wlroots_proto_text_input_active(s_proto)) {
+            auto keysym = GUI::ime_keysym_for_key_event(event);
+            if (keysym != 0
+                && ImeService::handle_key(keysym, ime_states_from_modifiers(event.modifiers()), false)) {
+                m_ime_swallowed_key = true;
+                return;
+            }
+            m_ime_swallowed_key = false;
+        }
         auto code = serenity_key_to_evdev(static_cast<unsigned>(event.key()));
         if (code < 0)
             return;
@@ -333,6 +438,16 @@ private:
         GUI::Widget::keyup_event(event);
         if (!m_surface)
             return;
+        /* 被吞掉的键，它的 release 也要吞，否则引擎会收到半对事件。 */
+        if (m_ime_swallowed_key) {
+            m_ime_swallowed_key = false;
+            if (wlroots_proto_text_input_active(s_proto)) {
+                auto keysym = GUI::ime_keysym_for_key_event(event);
+                if (keysym != 0)
+                    ImeService::handle_key(keysym, ime_states_from_modifiers(event.modifiers()), true);
+                return;
+            }
+        }
         auto code = serenity_key_to_evdev(static_cast<unsigned>(event.key()));
         if (code < 0)
             return;
@@ -376,6 +491,8 @@ private:
     HashMap<void*, Overlay> m_overlays;
 
     bool m_popup_surface { false };
+    /* 上一次 keydown 是否被输入法吞掉（决定它的 release 是否也要吞）。 */
+    bool m_ime_swallowed_key { false };
 
     Gfx::IntPoint m_last_pointer_position;
     bool m_has_pointer_position { false };
@@ -423,6 +540,59 @@ static HostedWindow* lookup(void* surface)
     auto it = s_windows.find(surface);
     return it == s_windows.end() ? nullptr : &it->value;
 }
+
+/* 键盘焦点在哪个 surface 上 —— 决定 commit 走 XIM 还是 text_input_v3。
+ * XIM 的 IC 焦点是 X 服务器级的，WS 焦点切到 Wayland 窗口时 X 侧不会自己
+ * 撤销 SET_IC_FOCUS；不同步这个标志，输入就会继续灌进上一个 X11 客户端。 */
+static void note_keyboard_focus(void* surface)
+{
+    auto* entry = surface ? lookup(surface) : nullptr;
+    XimServer::set_ws_x11_focus(entry && entry->xid != 0);
+}
+
+/* XIM 光标矩形换算：X11 客户端报的 spot_location 是相对它自己窗口的，
+ * xcb_translate_coordinates 之后变成 X root 坐标；但 WS 把这个 X 窗口摆在
+ * 另一个位置（级联偏移 + 标题栏），不能直接拿 root 坐标当屏幕坐标。
+ * 这里按 XID 找到宿主窗口，改用「窗口内容区原点 + 相对窗口的偏移」。 */
+static Gfx::IntRect resolve_xim_caret(unsigned long xid, int root_x, int root_y)
+{
+    for (auto const& it : s_windows) {
+        auto const& entry = it.value;
+        if (!entry.widget)
+            continue;
+        auto const& info = entry.info;
+        if (!info.xid)
+            continue;
+        /* client window 常常是 toplevel 的子窗口，XID 精确匹配会失败；
+         * 退化用几何包含判断：root 坐标落在这个 X 窗口的矩形内。 */
+        bool matches = info.xid == xid
+            || (root_x >= info.x && root_y >= info.y
+                && root_x < info.x + info.width && root_y < info.y + info.height);
+        if (!matches)
+            continue;
+        auto const& origin = entry.widget->screen_relative_rect();
+        int dx = root_x - info.x;
+        int dy = root_y - info.y;
+        return { origin.x() + dx, origin.y() + dy, 0, 20 };
+    }
+    return { root_x, root_y, 0, 20 };
+}
+
+
+/* 光标在屏幕坐标下的矩形：窗口内容区原点 + 客户端报的 surface 内光标矩形。
+ * 这是候选窗定位的唯一依据 —— 不再依赖 X root 坐标，也就不会因为 WS 挪过
+ * 窗口而错位。 */
+static Gfx::IntRect ime_caret_screen_rect(void* surface)
+{
+    auto* entry = lookup(surface);
+    if (!entry || !entry->widget)
+        return {};
+    auto const& origin = entry->widget->screen_relative_rect();
+    int cx = 0, cy = 0, cw = 0, ch = 0;
+    wlroots_proto_text_input_cursor_rect(s_proto, &cx, &cy, &cw, &ch);
+    return { origin.x() + cx, origin.y() + cy, cw, ch };
+}
+
 
 /* ── wlroots 协议回调 ──────────────────────────────────────────────────── */
 
@@ -498,10 +668,11 @@ static void on_toplevel_created(void* surface, char const* title, char const* ap
         wlroots_proto_toplevel_set_activated(s_proto, surface, active);
         if (active) {
             wlroots_proto_keyboard_enter(s_proto, surface);
+            note_keyboard_focus(surface);
             if (auto* e = lookup(surface))
                 e->widget->set_focus(true);
         } else {
-            wlroots_proto_keyboard_leave(s_proto);
+            host_keyboard_leave();
         }
     };
     /* 上面只是「变化」回调。窗口创建时往往已经处于激活态，那次变化早于注册，
@@ -511,6 +682,7 @@ static void on_toplevel_created(void* surface, char const* title, char const* ap
     if (entry->window->is_active()) {
         wlroots_proto_toplevel_set_activated(s_proto, surface, true);
         wlroots_proto_keyboard_enter(s_proto, surface);
+            note_keyboard_focus(surface);
         entry->widget->set_focus(true);
     }
 
@@ -737,8 +909,9 @@ static void on_popup_created(void* popup, void* surface, void* toplevel_surface,
         entry->window->on_active_window_change = [surface](bool active) {
             if (active) {
                 wlroots_proto_keyboard_enter(s_proto, surface);
+            note_keyboard_focus(surface);
             } else {
-                wlroots_proto_keyboard_leave(s_proto);
+                host_keyboard_leave();
             }
         };
     }
@@ -895,6 +1068,26 @@ static void on_subsurface_repositioned(void* subsurface, void* user)
     position_popup(*entry);
 }
 
+/* 客户端提交了新的文本输入状态（enable / 改了光标矩形 / surrounding text）。
+ * 第一次拿到焦点时告诉引擎「我这儿要输文本」，之后只更新光标位置。 */
+static void on_text_input_state_changed(void* surface, void*)
+{
+    if (!s_proto || !surface || !wlroots_proto_text_input_active(s_proto)) {
+        if (s_ime_surface) {
+            s_ime_surface = nullptr;
+            ImeService::focus_out();
+        }
+        return;
+    }
+    auto caret = ime_caret_screen_rect(surface);
+    if (s_ime_surface != surface) {
+        s_ime_surface = surface;
+        ImeService::focus_in(caret);
+    } else {
+        ImeService::update_caret(caret);
+    }
+}
+
 static void on_subsurface_destroyed(void* subsurface, void* user)
 {
     (void)user;
@@ -970,17 +1163,54 @@ static void pair_x11_surface(void* surface, XWM::WindowInfo const& info)
     bool const popup = info.override_redirect || info.is_popup;
     int x = -1;
     int y = -1;
-    if (popup && info.transient_for) {
-        /* Xwayland 的 X 屏幕坐标和 WS 的窗口栈是两套坐标系；popup 相对父
-         * toplevel 平移，否则菜单会飘到随机位置（旧桥同款处理）。 */
-        for (auto const& it : s_windows) {
-            auto const& parent = it.value;
-            if (parent.xid == info.transient_for && parent.info.xid != 0) {
-                x = parent.window->x() + (info.x - parent.info.x);
-                y = parent.window->y() + (info.y - parent.info.y);
+    if (popup) {
+        /*
+         * X 侧的根坐标是客户端「以为自己」的位置，而 WS 把宿主窗口摆到了别处，
+         * 两者差一个位移 —— 所以不能直接拿 info.x/y 当屏幕坐标。
+         *
+         * 锚点顺序：
+         *   1) WM_TRANSIENT_FOR（GTK/Wine 的菜单、下拉框都设它）
+         *   2) 当前激活的普通 X11 窗口（fcitx5 的候选窗是 override-redirect，
+         *      不设 transient_for；以前落到默认级联位 80+slot*24，表现就是
+         *      「候选窗在窗口左上角附近乱飘」）
+         *   3) 都没有才退回 root 绝对坐标（单窗口时两者基本一致）
+         *
+         * 位置基准用**内容区原点**（screen_relative_rect），不是 window->x()：
+         * 后者含标题栏和边框，会让 popup 整体左上偏一个框宽。
+         */
+        HostedWindow const* anchor = nullptr;
+        if (info.transient_for) {
+            for (auto const& it : s_windows) {
+                auto const& candidate = it.value;
+                if (candidate.xid == info.transient_for && candidate.info.xid != 0) {
+                    anchor = &candidate;
+                    break;
+                }
+            }
+        }
+        if (!anchor) {
+            for (auto const& it : s_windows) {
+                auto const& candidate = it.value;
+                if (candidate.info.xid == 0 || candidate.info.override_redirect || candidate.info.is_popup)
+                    continue;
+                if (!candidate.window || !candidate.window->is_active())
+                    continue;
+                anchor = &candidate;
                 break;
             }
         }
+
+        if (anchor && anchor->widget) {
+            auto const& origin = anchor->widget->screen_relative_rect();
+            x = origin.x() + (info.x - anchor->info.x);
+            y = origin.y() + (info.y - anchor->info.y);
+        } else {
+            x = info.x;
+            y = info.y;
+        }
+        outln("xwm: popup 0x{:x} '{}' x={} y={} anchor={:#x} anchor_x={} -> {},{}",
+            info.xid, info.title.c_str(), info.x, info.y,
+            anchor ? anchor->xid : 0ul, anchor ? anchor->info.x : 0, x, y);
     }
 
     auto* entry = ensure_hosted_window(surface, info.title.c_str(), x, y,
@@ -1010,8 +1240,9 @@ static void pair_x11_surface(void* surface, XWM::WindowInfo const& info)
                 widget->set_focus(true);
                 XWM::focus_window(xid);
                 wlroots_proto_keyboard_enter(s_proto, surface);
+            note_keyboard_focus(surface);
             } else {
-                wlroots_proto_keyboard_leave(s_proto);
+                host_keyboard_leave();
             }
         };
     }
@@ -1165,6 +1396,9 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
     callbacks.subsurface_destroyed = [](void* user, void* subsurface) {
         on_subsurface_destroyed(subsurface, user);
     };
+    callbacks.text_input_state_changed = [](void* user, void* surface) {
+        on_text_input_state_changed(surface, user);
+    };
 
     /* wl_output 只上报几何，尺寸取自 WS 的实际屏幕，避免 GDK 用错 workarea。 */
     auto screen = GUI::Desktop::the().rect();
@@ -1176,9 +1410,30 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
         return 1;
     }
 
+    /* 内建输入法：引擎回调 + 候选窗。引擎（serenityime socket）不在时
+     * 全部退化为 no-op，键盘行为与没有输入法完全一致。 */
+    setup_ime_service();
+    XimServer::set_caret_resolver([](unsigned long xid, int root_x, int root_y) {
+        return resolve_xim_caret(xid, root_x, root_y);
+    });
+
     /* X11/Wine 兼容：复用旧桥的 XwaylandBridge（spawn + displayfd 就绪）与
      * XWM（X 侧窗口管理），把 X 窗口转译成普通 GUI::Window。 */
     setup_x11_host();
+
+    /* X11 客户端的输入法入口（WordCraft/Wine/老 Qt）。
+     * 注意：Xwayland 是异步启动的，而 XOpenDisplay 是**同步阻塞**调用 —— 绝不能
+     * 放进每帧的 pump 里重试（实测会把整个事件循环卡死，桥"活着但不响应"）。
+     * 这里用 1s 定时器重试，最多 10 次。 */
+    static RefPtr<Core::Timer> xim_timer;
+    static int xim_attempts { 0 };
+    xim_timer = Core::Timer::create_repeating(1000, [] {
+        if (XimServer::initialize() || ++xim_attempts >= 10) {
+            if (xim_timer)
+                xim_timer->stop();
+        }
+    });
+    xim_timer->start();
 
     int fd = wlroots_proto_event_fd(s_proto);
     auto notifier = Core::Notifier::construct(fd, Core::Notifier::Type::Read);
@@ -1200,6 +1455,7 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
     auto pump = Core::Timer::create_repeating(8, [] {
         wlroots_proto_dispatch(s_proto, 0);
         XWM::pump();
+        XimServer::pump();
         wlroots_proto_flush(s_proto);
 
         /* popup 跟随父窗口移动：父内容区左上角变了就重新定位子窗口。 */

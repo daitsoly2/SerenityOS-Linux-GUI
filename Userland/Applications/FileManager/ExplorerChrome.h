@@ -220,6 +220,36 @@ private:
     bool m_has_selection { false };
 };
 
+// Thin draggable divider between the directory view and the preview pane.
+// Vista/7 keep the preview pane a fixed part of the window, but a fixed 190px
+// pane is useless for photos, so the user can drag this to trade width between
+// the two. It reports the requested delta via on_drag; the caller owns the
+// clamping and the actual layout change.
+class ExplorerSplitterHandle final : public GUI::Widget {
+    C_OBJECT(ExplorerSplitterHandle)
+public:
+    // Fired once when the drag starts (caller records the current pane width),
+    // then on every mouse move with the total delta from the press point.
+    Function<void()> on_drag_start;
+    Function<void(int total_delta)> on_drag;
+    Function<void()> on_drag_finished;
+
+protected:
+    virtual void paint_event(GUI::PaintEvent&) override;
+    virtual void mousedown_event(GUI::MouseEvent&) override;
+    virtual void mousemove_event(GUI::MouseEvent&) override;
+    virtual void mouseup_event(GUI::MouseEvent&) override;
+    virtual void enter_event(Core::Event&) override;
+    virtual void leave_event(Core::Event&) override;
+
+private:
+    ExplorerSplitterHandle() = default;
+
+    bool m_dragging { false };
+    bool m_hovered { false };
+    int m_origin_x { 0 };
+};
+
 // The little status-bar buttons: details / large icons / tiles / preview.
 class ExplorerViewSwitcher final : public GUI::Widget {
     C_OBJECT(ExplorerViewSwitcher)

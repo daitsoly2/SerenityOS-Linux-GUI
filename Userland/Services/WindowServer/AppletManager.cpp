@@ -32,12 +32,16 @@ AppletManager& AppletManager::the()
 
 void AppletManager::set_position(Gfx::IntPoint position)
 {
-    // No applets have been added yet, so there is no applet window to move.
     if (!m_window)
         return;
 
+    // The desktop shell now renders every notification-area icon as a child
+    // widget of the taskbar (see Ports/LinuxGUI/Shell/TrayAreaWidget.cpp).
+    // Keep this legacy AppletArea window hidden: a second, independently
+    // positioned top-level window used to drift relative to the taskbar
+    // whenever its layout changed, which made the "native" tray icons wander.
     m_window->move_to(position);
-    m_window->set_visible(true);
+    m_window->set_visible(false);
 }
 
 void AppletManager::set_hovered_applet(Window* applet)

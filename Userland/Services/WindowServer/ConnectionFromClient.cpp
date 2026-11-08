@@ -785,7 +785,7 @@ void ConnectionFromClient::did_finish_painting(i32 window_id, Vector<Gfx::IntRec
     auto& window = *(*it).value;
     for (auto& rect : rects)
         window.invalidate(rect);
-    if (window.has_alpha_channel() && window.alpha_hit_threshold() > 0.0f)
+    if ((window.has_alpha_channel() && window.alpha_hit_threshold() > 0.0f) || window.transparent_color().has_value())
         WindowManager::the().reevaluate_hover_state_for_window(&window);
 
     WindowSwitcher::the().refresh_if_needed();
@@ -884,6 +884,39 @@ void ConnectionFromClient::set_window_alpha_hit_threshold(i32 window_id, float t
         return;
     }
     it->value->set_alpha_hit_threshold(threshold);
+}
+
+void ConnectionFromClient::set_window_transparent_color(i32 window_id, Optional<Gfx::Color> const& color)
+{
+    auto it = m_windows.find(window_id);
+    if (it == m_windows.end()) {
+        did_misbehave("SetWindowTransparentColor: Bad window ID");
+        return;
+    }
+    it->value->set_transparent_color(color);
+}
+
+void ConnectionFromClient::set_window_skip_taskbar(i32 window_id, bool skip)
+{
+    auto it = m_windows.find(window_id);
+    if (it == m_windows.end()) {
+        did_misbehave("SetWindowSkipTaskbar: Bad window ID");
+        return;
+    }
+    it->value->set_skip_taskbar(skip);
+}
+
+Messages::WindowServer::GetWindowSkipTaskbarResponse ConnectionFromClient::get_window_skip_taskbar(i32 client_id, i32 window_id)
+{
+    // Resolved against the owning client, not this connection: the taskbar
+    // asks about windows that belong to another app.
+    auto* client_connection = from_client_id(client_id);
+    if (!client_connection)
+        return { false };
+    auto* window = client_connection->window_from_id(window_id);
+    if (!window)
+        return { false };
+    return { window->skip_taskbar() };
 }
 
 void ConnectionFromClient::start_window_resize(i32 window_id, i32 resize_direction)

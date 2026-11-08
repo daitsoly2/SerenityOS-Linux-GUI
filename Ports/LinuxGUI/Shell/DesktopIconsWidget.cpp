@@ -67,9 +67,8 @@
 
 namespace {
 
-constexpr int ICON_SIZE = 32;
-constexpr int CELL_WIDTH = 84;
-constexpr int CELL_HEIGHT = 76;
+// Icon size is user configurable (see set_icon_size); the cell leaves room
+// for the two-line label under the icon.
 constexpr int MARGIN_X = 10;
 constexpr int MARGIN_Y = 10;
 constexpr int MAX_ROWS = 6;
@@ -189,68 +188,24 @@ bool drop_memory_caches()
 
 }
 
-// Parse a freedesktop .desktop file into a Shortcut.
-Optional<DesktopIconsWidget::Shortcut> DesktopIconsWidget::parse_desktop_file(ByteString const& path)
-{
-    auto config = Core::ConfigFile::open(path);
-    if (config.is_error())
-        return {};
-    auto const& cfg = *config.value();
-    auto name = cfg.read_entry("Desktop Entry", "Name");
-    auto exec = cfg.read_entry("Desktop Entry", "Exec");
-    if (name.is_empty() || exec.is_empty())
-        return {};
-    if (cfg.read_bool_entry("Desktop Entry", "NoDisplay", false))
-        return {};
-
-    // Strip exec's field codes (e.g. "foo %U" -> "foo").
-    auto exec_clean = exec;
-    if (auto percent = exec_clean.find('%'); percent.has_value())
-        exec_clean = exec_clean.substring(0, percent.value()).trim_whitespace();
-
-    Shortcut s;
-    s.name = name;
-    s.exec = exec_clean;
-    s.icon_path = cfg.read_entry("Desktop Entry", "Icon");
-    s.path = cfg.read_entry("Desktop Entry", "Path");
-    s.source_file = path;
-    return s;
-}
-
-// Parse a Serenity .af file into a Shortcut.
-Optional<DesktopIconsWidget::Shortcut> DesktopIconsWidget::parse_af_file(ByteString const& path)
-{
-    auto config = Core::ConfigFile::open(path);
-    if (config.is_error())
-        return {};
-    auto const& cfg = *config.value();
-    auto name = cfg.read_entry("App", "Name");
-    auto exec = cfg.read_entry("App", "Executable");
-    if (name.is_empty() || exec.is_empty())
-        return {};
-    Shortcut s;
-    s.name = name;
-    s.exec = exec;
-    s.icon_path = cfg.read_entry("App", "Icon");
-    s.source_file = path;
-    return s;
-}
-
-// Scan a directory for .af / .desktop shortcut files and collect them.
+// Scan a directory for shortcuts. PortShortcuts::scan normalizes .af and
+// .desktop into one record, converts a .desktop once and then reuses the
+// saved .af (see AppShortcut.h), and keeps source_file pointing at the real
+// file so positions / drag & drop / delete still work on what the user sees.
 void DesktopIconsWidget::scan_shortcuts(ByteString const& directory, Vector<Shortcut>& out)
 {
-    Core::DirIterator it(directory, Core::DirIterator::SkipDots);
-    if (it.has_error())
-        return;
-    while (it.has_next()) {
-        auto name = it.next_path();
-        if (name.ends_with(".af"sv)) {
-            if (auto s = parse_af_file(ByteString::formatted("{}/{}", directory, name)); s.has_value())
-                out.append(s.release_value());
-        } else if (name.ends_with(".desktop"sv)) {
-            if (auto s = parse_desktop_file(ByteString::formatted("{}/{}", directory, name)); s.has_value())
-                out.append(s.release_value());
-        }
+    for (auto& record : PortShortcuts::scan({ directory })) {
+        Shortcut s;
+        s.name = record.name;
+        s.exec = record.program;
+        s.arguments = record.arguments;
+        s.icon_path = record.icon_spec;
+        s.path = record.working_directory;
+        s.source_file = record.source_file;
+        // Same rule as the file manager, so a wine launcher whose .lnk still
+        // exists is not painted with a red cross (see ExplorerMenus.h).
+        s.broken = ExplorerShared::shortcut_status_for_record(record) == ExplorerShared::ShortcutStatus::Broken;
+        out.append(move(s));
     }
 }
 
@@ -259,10 +214,12 @@ void DesktopIconsWidget::load_shortcuts_into(Vector<Shortcut> const& shortcuts)
     for (auto const& s : shortcuts) {
         Entry entry;
         entry.exec = s.exec;
+        entry.arguments = s.arguments;
         entry.icon_path = s.icon_path;
         entry.path = s.path;
         entry.source_file = s.source_file;
         entry.is_shortcut = true;
+        entry.broken = s.broken;
         entry.label = MUST(String::from_byte_string(s.name));
         // Shortcut names come from the .desktop/.af file ("Calculator"); run
         // them through the same UI table the menus use.
@@ -271,7 +228,18 @@ void DesktopIconsWidget::load_shortcuts_into(Vector<Shortcut> const& shortcuts)
         // literally ("&Sound Player"), so strip it here.
         if (auto bytes = entry.label.to_byte_string(); bytes.contains('&'))
             entry.label = MUST(String::from_byte_string(bytes.replace("&"sv, ""sv, AK::ReplaceMode::All)));
-        entry.icon = AppCatalog::the().icon_for_path(entry.icon_path, ICON_SIZE);
+        // Shortcut Icon= first (that is what Linux apps use), then the PE icon
+        // of the target executable for .exe shortcuts. PortIcons caches both.
+        entry.icon = PortIcons::for_shortcut(entry.icon_path, entry.exec, m_icon_size);
+        if (!entry.icon) {
+            // No Icon= and no PE resource: fall back to the generic file-type
+            // icon so a shortcut without artwork still looks like a shortcut.
+            auto icon = GUI::FileIconProvider::icon_for_path(s.source_file);
+            if (auto const* bitmap = icon.bitmap_for_size(m_icon_size)) {
+                if (auto clone = bitmap->clone(); !clone.is_error())
+                    entry.icon = clone.release_value();
+            }
+        }
         m_entries.append(move(entry));
     }
 }
@@ -300,7 +268,7 @@ void DesktopIconsWidget::load_plain_files_into(ByteString const& directory)
         // Entry keeps the bitmap, not the Icon, and icon_for_path() may build a
         // throw-away Icon (image thumbnails, symlink overlays) - clone so the
         // bitmap outlives the Icon.
-        if (auto const* bitmap = icon.bitmap_for_size(ICON_SIZE)) {
+        if (auto const* bitmap = icon.bitmap_for_size(m_icon_size)) {
             if (auto clone = bitmap->clone(); !clone.is_error())
                 entry.icon = clone.release_value();
         }
@@ -310,6 +278,7 @@ void DesktopIconsWidget::load_plain_files_into(ByteString const& directory)
 
 void DesktopIconsWidget::load_entries()
 {
+    load_icon_size();
     // Reloading re-lays-out the icon list, so any outstanding selection indices
     // may now point at the wrong icon. Drop it to stay consistent.
     clear_selection();
@@ -342,6 +311,50 @@ void DesktopIconsWidget::load_entries()
 }
 
 // --- Icon positions --------------------------------------------------------
+
+int DesktopIconsWidget::icon_size() const
+{
+    return m_icon_size;
+}
+
+void DesktopIconsWidget::load_icon_size()
+{
+    if (m_icon_size_loaded)
+        return;
+    m_icon_size_loaded = true;
+    auto config = Core::ConfigFile::open(desktop_config_path());
+    if (config.is_error())
+        return;
+    auto value = config.value()->read_num_entry("Settings"sv, "IconSize"sv, 32);
+    m_icon_size = clamp(value, 16, 96);
+}
+
+void DesktopIconsWidget::set_icon_size(int size)
+{
+    size = clamp(size, 16, 96);
+    if (m_icon_size == size)
+        return;
+    m_icon_size = size;
+
+    if (auto result = Core::Directory::create(LexicalPath::dirname(desktop_config_path()), Core::Directory::CreateDirectories::Yes); result.is_error())
+        warnln("shell: cannot create config directory: {}", result.error());
+    auto config = Core::ConfigFile::open(desktop_config_path(), Core::ConfigFile::AllowWriting::Yes);
+    if (config.is_error()) {
+        warnln("shell: cannot save icon size: {}", config.error());
+    } else {
+        config.value()->write_num_entry("Settings"sv, "IconSize"sv, size);
+        if (auto result = config.value()->sync(); result.is_error())
+            warnln("shell: cannot save icon size: {}", result.error());
+    }
+
+    // Saved positions are absolute pixels in the old grid; start from a clean
+    // layout so the icons do not end up straddling two cells.
+    clear_positions();
+    for (auto& entry : m_entries)
+        entry.rect = {};
+    layout_entries();
+    update();
+}
 
 ByteString DesktopIconsWidget::desktop_config_path()
 {
@@ -413,9 +426,9 @@ void DesktopIconsWidget::layout_entries()
     // layout below does not drop another icon on top of them.
     // No HashSet in this tree, and the icon count is tiny.
     HashMap<int, bool> taken;
-    auto cell_key = [](Gfx::IntPoint position) {
-        auto column = max(0, (position.x() - MARGIN_X + CELL_WIDTH / 2) / CELL_WIDTH);
-        auto row = max(0, (position.y() - MARGIN_Y + CELL_HEIGHT / 2) / CELL_HEIGHT);
+    auto cell_key = [this](Gfx::IntPoint position) {
+        auto column = max(0, (position.x() - MARGIN_X + cell_width() / 2) / cell_width());
+        auto row = max(0, (position.y() - MARGIN_Y + cell_height() / 2) / cell_height());
         return row * 1000 + column;
     };
 
@@ -423,7 +436,7 @@ void DesktopIconsWidget::layout_entries()
         auto it = positions.find(LexicalPath::basename(entry.source_file));
         if (it == positions.end())
             continue;
-        entry.rect = { it->value, { CELL_WIDTH - 8, CELL_HEIGHT - 6 } };
+        entry.rect = { it->value, { cell_width() - 8, cell_height() - 6 } };
         taken.set(cell_key(it->value), true);
     }
 
@@ -440,7 +453,7 @@ void DesktopIconsWidget::layout_entries()
             if (taken.contains(key))
                 continue;
             taken.set(key, true);
-            entry.rect = { MARGIN_X + column * CELL_WIDTH, MARGIN_Y + row * CELL_HEIGHT, CELL_WIDTH - 8, CELL_HEIGHT - 6 };
+            entry.rect = { MARGIN_X + column * cell_width(), MARGIN_Y + row * cell_height(), cell_width() - 8, cell_height() - 6 };
             break;
         }
     }
@@ -635,16 +648,27 @@ void DesktopIconsWidget::paint_event(GUI::PaintEvent& event)
             painter.draw_rect(entry.rect, Color::from_rgb(0xb0c8ff));
         }
 
-        auto icon_rect = Gfx::IntRect { entry.rect.x() + (entry.rect.width() - ICON_SIZE) / 2, entry.rect.y() + 4, ICON_SIZE, ICON_SIZE };
+        auto icon_rect = Gfx::IntRect { entry.rect.x() + (entry.rect.width() - m_icon_size) / 2, entry.rect.y() + 4, m_icon_size, m_icon_size };
         if (entry.icon)
             painter.draw_scaled_bitmap(icon_rect, *entry.icon, entry.icon->rect());
         else
             painter.fill_rect(icon_rect, Color::from_rgb(0x808080));
 
+        if (entry.broken) {
+            // Missing target: dim the artwork and stamp a red cross so the
+            // user can tell before double-clicking (which offers deletion).
+            painter.fill_rect(icon_rect, Color::from_argb(0x50ffffff));
+            auto badge = Gfx::IntRect { icon_rect.right() - 13, icon_rect.top(), 13, 13 };
+            painter.fill_rect(badge, Color::from_rgb(0xc00000));
+            painter.draw_line({ badge.x() + 2, badge.y() + 2 }, { badge.right() - 2, badge.bottom() - 2 }, Color::from_rgb(0xffffff));
+            painter.draw_line({ badge.right() - 2, badge.y() + 2 }, { badge.x() + 2, badge.bottom() - 2 }, Color::from_rgb(0xffffff));
+        }
+
         auto text_top = icon_rect.bottom() + 4;
         auto text_rect = Gfx::IntRect { entry.rect.x(), text_top, entry.rect.width(), entry.rect.bottom() - text_top };
         painter.draw_text(text_rect.translated(1, 1), entry.label, *label_font, Gfx::TextAlignment::Center, Color::from_rgb(0x000000));
-        painter.draw_text(text_rect, entry.label, *label_font, Gfx::TextAlignment::Center, Color::from_rgb(0xffffff));
+        painter.draw_text(text_rect, entry.label, *label_font, Gfx::TextAlignment::Center,
+            entry.broken ? Color::from_rgb(0xc0c0c0) : Color::from_rgb(0xffffff));
     }
 
     // Rubber-band selection rectangle.
@@ -874,7 +898,7 @@ void DesktopIconsWidget::drop_event(GUI::DropEvent& event)
         if (LexicalPath::dirname(path) == directory) {
             // Already on the desktop - just move the icon.
             save_position(LexicalPath::basename(path), next_position);
-            next_position.translate_by(0, CELL_HEIGHT);
+            next_position.translate_by(0, cell_height());
             changed = true;
             continue;
         }
@@ -889,7 +913,7 @@ void DesktopIconsWidget::drop_event(GUI::DropEvent& event)
 
         dbgln("desktop: added {} (from {})", name, path);
         save_position(name, next_position);
-        next_position.translate_by(0, CELL_HEIGHT);
+        next_position.translate_by(0, cell_height());
         changed = true;
     }
 
@@ -905,6 +929,13 @@ void DesktopIconsWidget::drop_event(GUI::DropEvent& event)
 // (force_game = true) forces umu + DWProton (per-game protonfixes).
 void DesktopIconsWidget::launch_entry(Entry const& entry, bool force_game)
 {
+    // Broken shortcut (program uninstalled, or the .af is truncated): ask
+    // whether to remove it instead of failing silently on double click.
+    if (entry.is_shortcut && entry.broken) {
+        ExplorerShared::offer_delete_broken_shortcut(window(), entry.source_file);
+        return;
+    }
+
     auto target = file_target(entry);
 
     if (!target.is_empty() && is_windows_binary(target)) {
@@ -928,9 +959,13 @@ void DesktopIconsWidget::launch_entry(Entry const& entry, bool force_game)
     }
 
     auto executable = PortHostify::resolve_executable(entry.exec);
-    Vector<char const*> no_arguments;
+    // Arguments come from the normalized shortcut (Exec= tokens with field
+    // codes removed); .af shortcuts usually have none.
+    Vector<char const*> argv;
+    for (auto const& argument : entry.arguments)
+        argv.append(argument.characters());
     if (auto result = Core::Process::spawn(executable.view(),
-            ReadonlySpan<char const*> { no_arguments.data(), no_arguments.size() },
+            ReadonlySpan<char const*> { argv.data(), argv.size() },
             Core::StandardPaths::home_directory());
         result.is_error())
         warnln("shell: failed to launch {}: {}", executable, result.error());
@@ -1093,7 +1128,7 @@ void DesktopIconsWidget::paste_into_desktop()
         if (LexicalPath::dirname(source) == directory) {
             // Already on the desktop - just move the icon.
             save_position(LexicalPath::basename(source), next_position);
-            next_position.translate_by(0, CELL_HEIGHT);
+            next_position.translate_by(0, cell_height());
             changed = true;
             continue;
         }
@@ -1115,7 +1150,7 @@ void DesktopIconsWidget::paste_into_desktop()
 
         dbgln("desktop: added {} (from {})", name, source);
         save_position(name, next_position);
-        next_position.translate_by(0, CELL_HEIGHT);
+        next_position.translate_by(0, cell_height());
         changed = true;
     }
 
@@ -1135,8 +1170,8 @@ void DesktopIconsWidget::paste_into_desktop()
 void DesktopIconsWidget::reveal_new_entry(ByteString const& name)
 {
     auto position = m_last_menu_position;
-    position.set_x(clamp(position.x(), 0, max(0, width() - (CELL_WIDTH - 8))));
-    position.set_y(clamp(position.y(), 0, max(0, height() - (CELL_HEIGHT - 6))));
+    position.set_x(clamp(position.x(), 0, max(0, width() - (cell_width() - 8))));
+    position.set_y(clamp(position.y(), 0, max(0, height() - (cell_height() - 6))));
     save_position(name, position);
     load_entries();
     update();
@@ -1187,6 +1222,13 @@ void DesktopIconsWidget::context_menu_event(GUI::ContextMenuEvent& event)
             layout_entries();
             update();
         }));
+        auto size_menu = m_menu->add_submenu(MUST(String::from_byte_string(translated("IconSize"sv, "&Icon size"sv))));
+        for (auto size : { 24, 32, 48, 64 }) {
+            auto label = ByteString::formatted("{} x {}", size, size);
+            auto action = GUI::Action::create_checkable(label, [this, size](auto&) { set_icon_size(size); });
+            action->set_checked(m_icon_size == size);
+            size_menu->add_action(move(action));
+        }
         m_menu->add_action(GUI::Action::create(translated("CleanMemoryCache"sv, "&Clean memory cache"sv), [this](auto&) {
             show_information(clear_memory_cache());
         }));
@@ -1265,21 +1307,28 @@ void DesktopIconsWidget::context_menu_event(GUI::ContextMenuEvent& event)
         actions->run_as_game = [target]() {
             ExplorerShared::launch_windows_binary(target, ExplorerShared::WindowsRunMode::Game);
         };
-        actions->fill_open_with = [target](GUI::Menu& menu) {
-            if (target.is_empty())
-                return;
-            for (auto const& app : AppCatalog::the().apps()) {
-                auto executable = PortHostify::resolve_executable(app->executable());
-                menu.add_action(GUI::Action::create(app->name(), [executable, target](auto&) {
-                    Vector<ByteString> arguments { target };
-                    if (auto result = Core::Process::spawn(executable.view(),
-                            ReadonlySpan<ByteString> { arguments.data(), arguments.size() },
-                            LexicalPath::dirname(target));
-                        result.is_error())
-                        warnln("shell: open-with {} failed: {}", executable, result.error());
-                }));
-            }
-        };
+        // Only offer "打开方式" when there is a real file to hand to the app.
+        // A shortcut with no Path= and an Executable that does not exist on
+        // the host (e.g. "/bin/TTPlayer") resolves to an empty target; the
+        // callback would then add nothing and leave an empty submenu behind.
+        if (!target.is_empty()) {
+            actions->fill_open_with = [target](GUI::Menu& menu) {
+                // Shared implementation (Common/ExplorerMenus.h): the MIME
+                // handler database first, so a .zip no longer offers games.
+                // Only when the port has no handler for the type do we fall
+                // back to the app catalog.
+                auto apps = ExplorerShared::registered_open_with_apps(target);
+                if (apps.is_empty()) {
+                    for (auto const& app : AppCatalog::the().apps()) {
+                        ExplorerShared::OpenWithApp entry;
+                        entry.name = app->name();
+                        entry.executable = app->executable();
+                        apps.append(move(entry));
+                    }
+                }
+                ExplorerShared::fill_open_with_menu(menu, apps, target);
+            };
+        }
         actions->cut = [this]() { copy_entries_to_clipboard(m_selection, true); };
         actions->copy = [this]() { copy_entries_to_clipboard(m_selection, false); };
         actions->copy_path = [&]() {
@@ -1297,7 +1346,12 @@ void DesktopIconsWidget::context_menu_event(GUI::ContextMenuEvent& event)
                 return;
             GUI::Desktop::the().set_wallpaper(bitmap.release_value(), target);
         };
-        actions->properties = [open_settings]() { open_settings(); };
+        // "属性" must describe the selected file/folder, not open the system
+        // Settings app. The FileManager binary already owns the real dialog
+        // (size, permissions, type-specific tabs), so ask it for one window.
+        actions->properties = [target, source = entry.source_file]() {
+            ExplorerShared::show_file_properties(target.is_empty() ? source : target);
+        };
 
         default_action = ExplorerShared::append_item_actions(*m_menu, item_context, actions);
         add_desktop_only_actions();

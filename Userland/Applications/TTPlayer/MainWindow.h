@@ -10,7 +10,9 @@
 #include "LedDisplay.h"
 #include "MarqueeLabel.h"
 #include "PlayerCore.h"
+#include "SkinPanel.h"
 #include "SkinButton.h"
+#include "SpectrumWidget.h"
 #include "TransportBar.h"
 #include <AK/ByteString.h>
 #include <AK/NonnullRefPtr.h>
@@ -115,6 +117,8 @@ private:
     void build_context_menu();
     void set_all_windows_on_top(bool on_top);
     void apply_skin_geometry();
+    void apply_window_shape();
+    void update_native_canvas();
 
     NonnullRefPtr<PlayerCore> m_core;
 
@@ -125,6 +129,9 @@ private:
     RefPtr<FlatSlider> m_seek;
     RefPtr<TransportBar> m_transport;
     RefPtr<FlatSlider> m_volume;
+    // Spectrum analyzer for the skin's <visual> box. A native skin has no
+    // bitmap for it, so it is the main window's one surviving child.
+    RefPtr<SpectrumWidget> m_spectrum;
     RefPtr<SkinButton> m_playlist_toggle;
     RefPtr<SkinButton> m_lyrics_toggle;
     RefPtr<SkinButton> m_eq_toggle;

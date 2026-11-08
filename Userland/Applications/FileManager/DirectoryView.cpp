@@ -8,6 +8,7 @@
 #include "DirectoryView.h"
 #include "FileUtils.h"
 #include <AK/LexicalPath.h>
+#include <Ports/LinuxGUI/Common/ExplorerMenus.h>
 #include <AK/NumberFormat.h>
 #include <AK/StringBuilder.h>
 #include <LibConfig/Client.h>
@@ -120,6 +121,12 @@ void DirectoryView::handle_activation(GUI::ModelIndex const& index)
         open(path);
         return;
     }
+
+    // A shortcut whose target was uninstalled (or whose .af is truncated) used
+    // to fail silently. Offer to remove it instead of falling through to the
+    // LaunchServer, which can only report "Could not open".
+    if (ExplorerShared::offer_delete_broken_shortcut(window(), path))
+        return;
 
     // Windows executables have no MIME handler in this port (no .af / no
     // LaunchServer.ini entry), so the LaunchServer dispatch below would just

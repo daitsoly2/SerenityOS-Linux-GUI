@@ -123,8 +123,18 @@ public:
     void navigate(Directions);
     void open_file(String const&, Core::File&);
 
+    // Interactive crop tool: while enabled, dragging with the primary mouse
+    // button draws a crop selection instead of panning the view.
+    void set_crop_mode(bool enabled);
+    bool crop_mode() const { return m_crop_mode; }
+    bool has_crop_selection() const { return m_crop_rect.has_value(); }
+    bool apply_crop();
+    void clear_crop_selection();
+
     Function<void()> on_doubleclick;
     Function<void(const GUI::DropEvent&)> on_drop;
+    Function<void(bool crop_mode)> on_crop_mode_change;
+    Function<void()> on_crop_selection_change;
 
     Function<void(Image*)> on_image_change;
 
@@ -134,6 +144,7 @@ private:
     virtual void paint_event(GUI::PaintEvent&) override;
     virtual void mousedown_event(GUI::MouseEvent&) override;
     virtual void mouseup_event(GUI::MouseEvent&) override;
+    virtual void mousemove_event(GUI::MouseEvent&) override;
     virtual void drag_enter_event(GUI::DragEvent&) override;
     virtual void drop_event(GUI::DropEvent&) override;
     virtual void resize_event(GUI::ResizeEvent&) override;
@@ -142,6 +153,12 @@ private:
     void animate();
     Vector<ByteString> load_files_from_directory(ByteString const& path) const;
     ErrorOr<void> try_open_file(String const&, Core::File&);
+    void reset_crop_state();
+    Optional<Gfx::IntRect> current_crop_rect() const;
+    Optional<Gfx::IntPoint> content_position_clamped(Gfx::IntPoint frame_position) const;
+    void paint_crop_overlay(Gfx::Painter&);
+
+    static RefPtr<Image> crop_image_to_rect(Image const&, Gfx::IntRect const& image_crop_rect);
 
     String m_path;
     RefPtr<Image> m_image;
@@ -167,6 +184,11 @@ private:
     Vector<ByteString> m_files_in_same_dir;
     Optional<size_t> m_current_index;
     Gfx::ScalingMode m_scaling_mode { Gfx::ScalingMode::BoxSampling };
+
+    bool m_crop_mode { false };
+    bool m_crop_drag_in_progress { false };
+    Optional<Gfx::IntPoint> m_crop_drag_anchor;
+    Optional<Gfx::IntRect> m_crop_rect;
 };
 
 }

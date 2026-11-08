@@ -64,8 +64,20 @@ pkg_check_modules(XCOMPOSITE REQUIRED IMPORTED_TARGET xcomposite)
 pkg_get_variable(WLROOTS_PREFIX wlroots-0.20 prefix)
 
 if (WLROOTS_FOUND)
+# XIM 协议层：XCBImdkit（fcitx5 的 xim addon 用的同一个库，走 XCB 原生事件）。
+# 头文件 vendored 在 Ports/LinuxGUI/X11Compat/XCBImdkit/include（LGPL-2.1），
+# 库用系统 libxcb-imdkit.so.1（VM 里已装）。
+pkg_check_modules(XCB REQUIRED IMPORTED_TARGET xcb)
+find_library(XCB_IMDKIT_LIB NAMES xcb-imdkit libxcb-imdkit.so.1
+    PATHS /usr/lib/x86_64-linux-gnu /usr/local/lib)
+if (NOT XCB_IMDKIT_LIB)
+    message(FATAL_ERROR "libxcb-imdkit not found (apt install libxcb-imdkit1)")
+endif()
+
 add_executable(serenity-wlroots-host
     main.cpp
+    ImeService.cpp
+    XimServer.cpp
     wlroots_proto.c
     # 复用已有且验证过的 X11 侧实现（XWM + rootless Xwayland），不在新桥里
     # 复制一份窗口管理逻辑。这两个文件原在已删除的 WaylandHost 目录。
@@ -74,11 +86,17 @@ add_executable(serenity-wlroots-host
 )
 
 target_include_directories(serenity-wlroots-host PRIVATE
+    "${SERENITY_PROJECT_ROOT}/Ports/LinuxGUI/X11Compat/XCBImdkit/include"
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${WLROOTS_PREFIX}/include
     # LibGUI 的 Desktop.h 会拉进 TaskbarWindow.h，后者引用任务栏 IME 指示器头。
     ${SERENITY_PROJECT_ROOT}/Ports/LinuxGUI/IMEFrontend
 )
+
+# 上游 xcb-imdkit 头有 C/C++ 空结构体告警、Xlib 的 XKeycodeToKeysym 是 deprecated。
+# 只给这一个 TU 放宽，不改 vendored 头。
+set_source_files_properties(XimServer.cpp PROPERTIES
+    COMPILE_OPTIONS "-Wno-extern-c-compat;-Wno-deprecated-declarations")
 
 set_source_files_properties(wlroots_proto.c PROPERTIES
     COMPILE_DEFINITIONS WLR_USE_UNSTABLE
@@ -110,6 +128,8 @@ target_link_libraries(serenity-wlroots-host PRIVATE
     PkgConfig::XKBCOMMON
     PkgConfig::X11
     PkgConfig::XCOMPOSITE
+    PkgConfig::XCB
+    ${XCB_IMDKIT_LIB}
 )
 
 set_target_properties(serenity-wlroots-host PROPERTIES

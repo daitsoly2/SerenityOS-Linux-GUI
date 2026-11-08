@@ -20,13 +20,20 @@
 #define ENUMERATE_IMAGE_FORMATS                \
     __ENUMERATE_IMAGE_FORMAT(bmp, ".bmp")      \
     __ENUMERATE_IMAGE_FORMAT(dds, ".dds")      \
+    __ENUMERATE_IMAGE_FORMAT(dicom, ".dcm")    \
+    __ENUMERATE_IMAGE_FORMAT(dicom, ".dicom")  \
     __ENUMERATE_IMAGE_FORMAT(gif, ".gif")      \
     __ENUMERATE_IMAGE_FORMAT(ico, ".ico")      \
     __ENUMERATE_IMAGE_FORMAT(iff, ".iff")      \
     __ENUMERATE_IMAGE_FORMAT(jpeg, ".jb2")     \
     __ENUMERATE_IMAGE_FORMAT(jpeg, ".jbig2")   \
     __ENUMERATE_IMAGE_FORMAT(jpeg2000, ".jp2") \
+    __ENUMERATE_IMAGE_FORMAT(jpeg2000, ".j2k") \
+    __ENUMERATE_IMAGE_FORMAT(jpeg2000, ".j2c") \
+    __ENUMERATE_IMAGE_FORMAT(jpeg2000, ".jpc") \
     __ENUMERATE_IMAGE_FORMAT(jpeg, ".jpeg")    \
+    __ENUMERATE_IMAGE_FORMAT(jpeg, ".jpe")     \
+    __ENUMERATE_IMAGE_FORMAT(jpeg, ".jfif")    \
     __ENUMERATE_IMAGE_FORMAT(jpeg2000, ".jpf") \
     __ENUMERATE_IMAGE_FORMAT(jpeg, ".jpg")     \
     __ENUMERATE_IMAGE_FORMAT(jpeg2000, ".jpx") \
@@ -35,14 +42,16 @@
     __ENUMERATE_IMAGE_FORMAT(pam, ".pam")      \
     __ENUMERATE_IMAGE_FORMAT(pbm, ".pbm")      \
     __ENUMERATE_IMAGE_FORMAT(pgm, ".pgm")      \
-    __ENUMERATE_IMAGE_FORMAT(png, ".png")      \
     __ENUMERATE_IMAGE_FORMAT(ppm, ".ppm")      \
+    __ENUMERATE_IMAGE_FORMAT(ppm, ".pnm")      \
+    __ENUMERATE_IMAGE_FORMAT(png, ".png")      \
+    __ENUMERATE_IMAGE_FORMAT(png, ".apng")     \
     __ENUMERATE_IMAGE_FORMAT(qoi, ".qoi")      \
     __ENUMERATE_IMAGE_FORMAT(tga, ".tga")      \
     __ENUMERATE_IMAGE_FORMAT(tiff, ".tif")     \
     __ENUMERATE_IMAGE_FORMAT(tiff, ".tiff")    \
     __ENUMERATE_IMAGE_FORMAT(tvg, ".tvg")      \
-    __ENUMERATE_IMAGE_FORMAT(tvg, ".webp")
+    __ENUMERATE_IMAGE_FORMAT(webp, ".webp")
 
 namespace Gfx {
 

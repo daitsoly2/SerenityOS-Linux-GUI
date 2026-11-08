@@ -1,0 +1,6 @@
+[App]
+Name=打印管理
+Executable=/bin/PrintSettings
+Category=Settings
+Description=查看打印状态、管理打印机和打印任务
+ExcludeFromSystemMenu=true

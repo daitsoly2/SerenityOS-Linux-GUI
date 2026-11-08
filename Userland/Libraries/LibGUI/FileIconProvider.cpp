@@ -20,8 +20,16 @@
 #include <LibGfx/Bitmap.h>
 #include <LibGfx/ImageFormats/PNGLoader.h>
 #include <string.h>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef AK_OS_SERENITY
+// Host-only: one icon resolver for .exe (PE resources), .af and freedesktop
+// .desktop shortcuts. Putting this in FileIconProvider (rather than in the
+// desktop widget) makes FileManager, PropertiesWindow, Explorer previews and
+// every other GUI client show the same icon for the same file.
+#    include <Ports/LinuxGUI/Common/AppShortcut.h>
+#endif
 
 namespace GUI {
 
@@ -44,6 +52,22 @@ static RefPtr<Gfx::Bitmap> s_symlink_emblem_small;
 
 static HashMap<ByteString, Icon> s_filetype_icons;
 static HashMap<ByteString, Vector<ByteString>> s_filetype_patterns;
+// Pattern matching order must follow the [Icons] section, not the hash map:
+// with an unordered walk a file such as "src.tar.gz" could pick *.gz in one
+// process and *.tar.* in another, and the more specific rule has to win.
+static Vector<ByteString> s_filetype_order;
+
+// Serenity reads /etc/FileIconProvider.ini. The Linux port keeps its own tree
+// under $SERENITY_PREFIX, so prefer that copy and only fall back to the host's
+// /etc (which a distribution may also populate).
+static ByteString icon_provider_config_path()
+{
+#ifndef AK_OS_SERENITY
+    if (char const* prefix = getenv("SERENITY_PREFIX"); prefix && *prefix)
+        return ByteString::formatted("{}/etc/FileIconProvider.ini", prefix);
+#endif
+    return ByteString { "/etc/FileIconProvider.ini" };
+}
 
 static void initialize_executable_icon_if_needed()
 {
@@ -69,7 +93,7 @@ static void initialize_if_needed()
     if (s_initialized)
         return;
 
-    auto config = Core::ConfigFile::open("/etc/FileIconProvider.ini").release_value_but_fixme_should_propagate_errors();
+    auto config = Core::ConfigFile::open(icon_provider_config_path());
 
     s_symlink_emblem = MUST(Gfx::Bitmap::load_from_uri("resource://icons/symlink-emblem.png"sv));
     s_symlink_emblem_small = MUST(Gfx::Bitmap::load_from_uri("resource://icons/symlink-emblem-small.png"sv));
@@ -90,9 +114,15 @@ static void initialize_if_needed()
     initialize_filetype_image_icon_if_needed();
     initialize_executable_icon_if_needed();
 
-    for (auto& filetype : config->keys("Icons")) {
-        s_filetype_icons.set(filetype, Icon::default_icon(ByteString::formatted("filetype-{}", filetype)));
-        s_filetype_patterns.set(filetype, config->read_entry("Icons", filetype).split(','));
+    // A missing config is not fatal: the built-in icons above still work and
+    // every file simply falls back to filetype-unknown.
+    if (!config.is_error()) {
+        for (auto& filetype : config.value()->keys("Icons")) {
+            if (!s_filetype_icons.contains(filetype))
+                s_filetype_order.append(filetype);
+            s_filetype_icons.set(filetype, Icon::default_icon(ByteString::formatted("filetype-{}", filetype)));
+            s_filetype_patterns.set(filetype, config.value()->read_entry("Icons", filetype).split(','));
+        }
     }
 
     s_initialized = true;
@@ -242,6 +272,20 @@ Icon FileIconProvider::icon_for_executable(ByteString const& path)
 Icon FileIconProvider::icon_for_path(StringView path, mode_t mode)
 {
     initialize_if_needed();
+#ifndef AK_OS_SERENITY
+    // Linux GUI port: application shortcuts and Windows executables carry
+    // their own icon. Do this before the generic file-type lookup; on a miss
+    // (no Icon=, no PE resource) we fall through to the usual Serenity icon.
+    if (PortShortcuts::is_shortcut_or_executable(path)) {
+        if (auto large = PortShortcuts::icon_for_file(path, 32)) {
+            Icon icon;
+            icon.set_bitmap_for_size(32, move(large));
+            if (auto small = PortShortcuts::icon_for_file(path, 16))
+                icon.set_bitmap_for_size(16, move(small));
+            return icon;
+        }
+    }
+#endif
     if (path == "/")
         return s_hard_disk_icon;
     if (S_ISDIR(mode)) {
@@ -300,7 +344,7 @@ Icon FileIconProvider::icon_for_path(StringView path, mode_t mode)
     if (Gfx::Bitmap::is_path_a_supported_image_format(path))
         return s_filetype_image_icon;
 
-    for (auto& filetype : s_filetype_icons.keys()) {
+    for (auto& filetype : s_filetype_order) {
         auto pattern_it = s_filetype_patterns.find(filetype);
         if (pattern_it == s_filetype_patterns.end())
             continue;

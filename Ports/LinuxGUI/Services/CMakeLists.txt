@@ -136,3 +136,19 @@ target_link_libraries(serenity-audio-server PRIVATE LibCore LibThreading LibIPC 
 set_target_properties(serenity-audio-server PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
 )
+
+# --- PrintService ----------------------------------------------------------
+# Session-side printing front-end: apps ask it for printers / submit jobs
+# instead of shelling out to lp(1) themselves. CUPS remains the real queue
+# manager; this only wraps `lpstat -e` / `lp` behind a Unix socket.
+add_executable(serenity-print-service
+    ${CMAKE_CURRENT_SOURCE_DIR}/main_print_service.cpp
+)
+# Notifications go out over the session bus (org.freedesktop.Notifications is
+# served by our compositor). The PkgConfig::DBUS imported target is scoped to
+# the parent directory, so use the variables, which do inherit.
+target_include_directories(serenity-print-service PRIVATE ${DBUS_INCLUDE_DIRS} ${SERENITY_PROJECT_ROOT})
+target_link_libraries(serenity-print-service PRIVATE LibCore LibGfx LibCompress AK ${DBUS_LIBRARIES})
+set_target_properties(serenity-print-service PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

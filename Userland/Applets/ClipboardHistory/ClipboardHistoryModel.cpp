@@ -219,13 +219,25 @@ ErrorOr<void> ClipboardHistoryModel::read_from_file(ByteString const& path)
 
 ErrorOr<void> ClipboardHistoryModel::write_to_file()
 {
+    // Images (image/x-serenityos) can be several MiB each; persisting them all can make
+    // the history file explode. Skip oversized payloads instead of dropping them while
+    // the session is running.
+    constexpr size_t max_persisted_item_bytes = 8 * 1024 * 1024;
+
     auto file = TRY(Core::File::open(m_path, Core::File::OpenMode::Write | Core::File::OpenMode::Truncate));
     JsonArray array;
     array.ensure_capacity(m_history_items.size());
     for (auto const& item : m_history_items) {
-        if (!item.data_and_type.mime_type.starts_with("text/"sv))
+        if (item.data_and_type.data.size() > max_persisted_item_bytes) {
+            dbgln("ClipboardHistory: not persisting {} item of {} bytes (over {} byte limit)", item.data_and_type.mime_type, item.data_and_type.data.size(), max_persisted_item_bytes);
             continue;
-        TRY(array.append(TRY(item.to_json())));
+        }
+        auto item_json_or_error = item.to_json();
+        if (item_json_or_error.is_error()) {
+            dbgln("ClipboardHistory: not persisting {} item: {}", item.data_and_type.mime_type, item_json_or_error.release_error());
+            continue;
+        }
+        TRY(array.append(item_json_or_error.release_value()));
     }
     auto json_string = array.to_byte_string();
     TRY(file->write_until_depleted(json_string.bytes()));

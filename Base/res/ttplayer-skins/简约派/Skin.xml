@@ -1,0 +1,50 @@
+<skin version="2" name="¼òÔ¼ÅÉ" author="fantasia" url="http://www.eads999.com" email="attfish@gmail.com" transparent_color="#ff00ff">
+    <player_window image="player_skin.bmp">
+      <play position="42, 27, 62, 47" image="play.bmp"/>
+      <pause position="42, 27, 62, 47" image="pause.bmp"/>
+      <stop position="64, 27, 84, 47" image="stop.bmp"/>
+      <prev position="19, 27, 39, 47" image="prev.bmp"/>
+      <next position="86, 27, 106, 47" image="next.bmp"/>
+      <mute position="20, 74, 28, 82" image="mute.bmp"/>
+      <minimize position="264, 7, 273, 16" image="minimize.bmp"/>
+      <exit position="284, 7, 293, 16" image="exit.bmp"/>
+      <progress position="168, 76, 277, 77" bar_image="" thumb_image="thumb.bmp" fill_image="progress_fill.bmp"/>
+      <volume position="35, 76, 96, 81" vertical="false" bar_image="" thumb_image="thumb.bmp" fill_image=""/>
+      <icon position="509, 5, 25, 21"icon="iPod.ico"/>
+      <info position="167, 57, 277, 69" color="#4E4B4A" font="tahoma" font_size="14"/>
+     <stereo position="238, 33, 277, 47" color="#C3C3C2" bkgnd="" font="Tahoma" font_size="14" align="right" />
+     <status position="167, 33, 235, 47" color="#4E4B4A" bkgnd="" font="Tahoma" font_size="14" align="right" />
+   </player_window>
+   <lyric_window position="300, 0, 600, 100" resize_rect="14, 34, 256, 42" image="lyric_skin.bmp">
+      <close position="284, 7, 293, 16" image="exit.bmp" align="right"/>
+      <ontop position="264, 7, 273, 16" image="ontop.bmp" align="right"/>
+      <lyric position="10, 23, 289, 87"/>
+  </lyric_window>
+   <equalizer_window position="300, 100, 600, 200" image="equalizer_skin.bmp" eq_interval="13">
+      <close position="284, 7, 293, 16" image="exit.bmp" align="right"/>
+      <enabled position="16, 7, 28, 19" image="eq_enabled.bmp"/>
+      <profile position="36, 7, 48, 19" image="eq_profile.bmp"/>
+      <reset position="56, 7, 68, 19" image="eq_reset.bmp"/>
+      <balance position="86, 17, 140, 19" thumb_image="thumb.bmp" bar_image=""/>
+      <surround position="161, 17, 215, 19" thumb_image="thumb.bmp" bar_image=""/>
+      <preamp position="26, 31, 33, 87" thumb_image="eq_thumb.bmp" bar_image=""/>
+      <eqfactor position="76, 31, 83, 87" thumb_image="eq_thumb.bmp" bar_image="" fill_image=""/>
+   </equalizer_window>
+   <playlist_window position="0, 100, 300, 200" resize_rect="14, 34, 256, 42" image="playlist_skin.bmp">
+      <close position="284, 7, 293, 16" image="exit.bmp" align="right"/>
+      <toolbar position="10, 17, 289, 33" image="playlist_toolbar.bmp"/>
+      <playlist position="10, 37, 289, 87"/>
+   </playlist_window>
+   <mini_window position="0, 100, 260, 142" resize_rect="14, 34, 256, 42" image="mini_skin.bmp">
+      <play position="48, 11, 68, 31" image="play.bmp" />
+      <pause position="48, 11, 68, 31" image="pause.bmp" />
+      <stop position="70, 11, 90, 31" image="stop.bmp" />
+      <prev position="26, 11, 46, 31" image="prev.bmp" />
+      <next position="92, 11, 112, 31" image="next.bmp" />
+      <exit position="144, 27, 153, 36" image="exit.bmp" />
+      <minimize position="144, 6, 153, 15" image="minimize.bmp" />
+	  <lyric position="170, 1, 181, 12" image="mini_lyric.bmp" />
+		<visual position="133, 3, 123, 2" />
+	 <icon position="500, 4, 18, 20" />
+   </mini_window>
+</skin>

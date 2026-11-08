@@ -8,8 +8,10 @@
 
 #include "MainWidget.h"
 #include "ViewWidget.h"
+#include <AK/LexicalPath.h>
 #include <LibConfig/Client.h>
 #include <LibCore/ArgsParser.h>
+#include <LibCore/Command.h>
 #include <LibCore/System.h>
 #include <LibDesktop/Launcher.h>
 #include <LibFileSystemAccessClient/Client.h>
@@ -17,28 +19,104 @@
 #include <LibGUI/ActionGroup.h>
 #include <LibGUI/Application.h>
 #include <LibGUI/BoxLayout.h>
+#include <LibGUI/Button.h>
+#include <LibGUI/CheckBox.h>
 #include <LibGUI/Clipboard.h>
+#include <LibGUI/ComboBox.h>
 #include <LibGUI/Desktop.h>
+#include <LibGUI/Dialog.h>
 #include <LibGUI/FilePicker.h>
+#include <LibGUI/ItemListModel.h>
 #include <LibGUI/Label.h>
 #include <LibGUI/Menu.h>
 #include <LibGUI/Menubar.h>
 #include <LibGUI/MessageBox.h>
+#include <LibGUI/InputBox.h>
+#include <LibGUI/Painter.h>
+#include <LibGUI/SpinBox.h>
 #include <LibGUI/Toolbar.h>
 #include <LibGUI/ToolbarContainer.h>
 #include <LibGUI/Window.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/ImageFormats/BMPWriter.h>
+#include <LibGfx/ImageFormats/GIFWriter.h>
+#include <LibGfx/ImageFormats/JPEGWriter.h>
+#include <LibGfx/ImageFormats/PNGWriter.h>
+#include <LibGfx/ImageFormats/PortableFormatWriter.h>
+#include <LibGfx/ImageFormats/QOIWriter.h>
+#include <LibGfx/ImageFormats/TIFFWriter.h>
+#include <LibGfx/ImageFormats/WebPWriter.h>
 #include <LibGfx/Palette.h>
 #include <LibGfx/Rect.h>
 #include <LibMain/Main.h>
 #include <LibURL/URL.h>
+#ifndef AK_OS_SERENITY
+#    include <Ports/LinuxGUI/Common/PortPrint.h>
+#endif
 #include <string.h>
 
 using namespace ImageViewer;
 
+// Encode the current image in one of the writable Gfx image formats.
+// `extension` must be one of the values listed in export_format_extensions().
+static ErrorOr<void> encode_image_to_stream(Gfx::Bitmap const& bitmap, Stream& stream, StringView extension)
+{
+    if (extension == "png"sv)
+        return Gfx::PNGWriter::encode(stream, bitmap, {});
+    if (extension == "jpg"sv || extension == "jpeg"sv) {
+        Gfx::JPEGEncoderOptions options;
+        options.quality = 90;
+        return Gfx::JPEGWriter::encode(stream, bitmap, options);
+    }
+    if (extension == "gif"sv)
+        return Gfx::GIFWriter::encode(stream, bitmap);
+    if (extension == "tif"sv || extension == "tiff"sv)
+        return Gfx::TIFFWriter::encode(stream, bitmap, {});
+    if (extension == "webp"sv)
+        return Gfx::WebPWriter::encode(stream, bitmap, {});
+    if (extension == "ppm"sv)
+        return Gfx::PortableFormatWriter::encode(stream, bitmap, {});
+    if (extension == "bmp"sv)
+        return stream.write_until_depleted(TRY(Gfx::BMPWriter::encode(bitmap, {})));
+    if (extension == "qoi"sv)
+        return stream.write_until_depleted(TRY(Gfx::QOIWriter::encode(bitmap)));
+    return Error::from_string_literal("Unsupported export format");
+}
+
+static void export_current_image(GUI::Window* window, ViewWidget& widget, StringView extension, StringView format_name)
+{
+    auto const* image = widget.image();
+    if (!image)
+        return;
+
+    ByteString name = "untitled";
+    if (!widget.path().is_empty()) {
+        auto const lexical_path = LexicalPath(widget.path().to_byte_string());
+        if (!lexical_path.title().is_empty())
+            name = lexical_path.title();
+    }
+
+    auto response = FileSystemAccessClient::Client::the().save_file(window, name, extension);
+    if (response.is_error())
+        return;
+    auto file = response.value().release_stream();
+
+    auto do_export = [&]() -> ErrorOr<void> {
+        auto const bitmap = TRY(image->bitmap({}));
+        return encode_image_to_stream(*bitmap, *file, extension);
+    };
+    if (auto result = do_export(); result.is_error()) {
+        GUI::MessageBox::show(window,
+            ByteString::formatted("Failed to export image as {}: {}", format_name, result.release_error()),
+            "Export Failed"sv,
+            GUI::MessageBox::Type::Error);
+    }
+}
+
 ErrorOr<int> serenity_main(Main::Arguments arguments)
 {
-    TRY(Core::System::pledge("stdio recvfd sendfd rpath wpath cpath unix thread"));
+    // proc/exec: printing shells out to lp(1).
+    TRY(Core::System::pledge("stdio recvfd sendfd rpath wpath cpath unix thread proc exec"));
 
     auto app = TRY(GUI::Application::create(arguments));
 
@@ -182,6 +260,30 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
             widget.flip(Gfx::Orientation::Horizontal);
         });
 
+    auto crop_tool_action = GUI::Action::create_checkable("&Crop", { Mod_None, Key_C }, TRY(Gfx::Bitmap::load_from_uri("resource://icons/16x16/crop.png"sv)),
+        [&](auto& action) {
+            widget.set_crop_mode(action.is_checked());
+        });
+
+    auto apply_crop_action = GUI::Action::create("&Apply Crop", { Mod_None, Key_Return }, TRY(Gfx::Bitmap::load_from_uri("resource://icons/16x16/crop.png"sv)),
+        [&](auto&) {
+            if (!widget.apply_crop())
+                GUI::MessageBox::show(window,
+                    "Drag a selection rectangle over the image first, then apply the crop."sv,
+                    "Nothing to Crop"sv,
+                    GUI::MessageBox::Type::Information);
+        });
+    apply_crop_action->set_enabled(false);
+
+    // Keep the toolbar button / menu toggle and the apply action in sync with the widget's crop state.
+    widget.on_crop_mode_change = [&](bool enabled) {
+        crop_tool_action->set_checked(enabled);
+        apply_crop_action->set_enabled(enabled && widget.has_crop_selection());
+    };
+    widget.on_crop_selection_change = [&] {
+        apply_crop_action->set_enabled(crop_tool_action->is_checked() && widget.has_crop_selection());
+    };
+
     auto desktop_wallpaper_action = GUI::Action::create("Set as Desktop &Wallpaper", TRY(Gfx::Bitmap::load_from_uri("resource://icons/16x16/app-display-settings.png"sv)),
         [&](auto&) {
             if (!GUI::Desktop::the().set_wallpaper(widget.image()->bitmap(GUI::Desktop::the().rect().size()).release_value_but_fixme_should_propagate_errors(), widget.path())) {
@@ -189,6 +291,22 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
                     ByteString::formatted("set_wallpaper({}) failed", widget.path()),
                     "Could not set wallpaper"sv,
                     GUI::MessageBox::Type::Error);
+            }
+        });
+
+    auto print_action = GUI::Action::create("打印(&P)…"sv, { Mod_Ctrl, Key_P },
+        TRY(Gfx::Bitmap::load_from_uri("resource://icons/16x16/printer.png"sv)),
+        [&](auto&) {
+            PortPrint::show_dialog(window, widget.path().to_byte_string(), "打印图片"sv);
+        });
+
+    auto export_action = GUI::Action::create("导出为(&E)…"sv, { Mod_Ctrl | Mod_Shift, Key_E }, TRY(Gfx::Bitmap::load_from_uri("resource://icons/16x16/save.png"sv)),
+        [&](auto&) {
+            String extension;
+            if (GUI::InputBox::show(window.ptr(), extension, "输入导出格式（如 png、jpg、webp、gif、tiff、bmp、qoi、ppm）："sv, "导出图片"sv, GUI::InputType::NonemptyText) == GUI::InputBox::ExecResult::OK) {
+                auto const ext = extension.to_byte_string().trim_whitespace().to_lowercase();
+                if (!ext.is_empty())
+                    export_current_image(window.ptr(), widget, ext, ext);
             }
         });
 
@@ -278,6 +396,7 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
         vertical_flip_action->set_enabled(should_enable_image_actions);
         horizontal_flip_action->set_enabled(should_enable_image_actions);
         desktop_wallpaper_action->set_enabled(should_enable_image_actions);
+        print_action->set_enabled(should_enable_image_actions);
 
         go_first_action->set_enabled(should_enable_backward_actions);
         go_back_action->set_enabled(should_enable_backward_actions);
@@ -294,6 +413,7 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
 
     main_toolbar.add_action(open_action);
     main_toolbar.add_action(delete_action);
+    main_toolbar.add_action(print_action);
     main_toolbar.add_separator();
     main_toolbar.add_action(go_first_action);
     main_toolbar.add_action(go_back_action);
@@ -307,6 +427,8 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
     auto file_menu = window->add_menu("&File"_string);
     file_menu->add_action(open_action);
     file_menu->add_action(delete_action);
+    file_menu->add_action(print_action);
+    file_menu->add_action(export_action);
     file_menu->add_separator();
 
     file_menu->add_recent_files_list([&](auto& action) {

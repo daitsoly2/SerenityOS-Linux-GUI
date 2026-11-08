@@ -22,6 +22,9 @@ struct TTThemeColors {
     // multiplying a light colour: darkened()/lightened() multiply channels and
     // can wrap past 255 (a pale blue turns into bright red).
     Gfx::Color title_strip { Gfx::Color::from_rgb(0x16283f) };
+    // Caption colour is deliberately separate from `text`: light skins set
+    // `text` dark for the body, which makes it invisible on the dark strip.
+    Gfx::Color title_text { Gfx::Color::from_rgb(0xdce9f8) };
     Gfx::Color bevel_light { Gfx::Color::from_rgb(0x4a7ab5) };
     Gfx::Color bevel_mid { Gfx::Color::from_rgb(0x2a4a74) };
     Gfx::Color bevel_dark { Gfx::Color::from_rgb(0x050a12) };
@@ -50,7 +53,7 @@ namespace TTSkin {
 TTThemeColors const& colors();
 void set_colors(TTThemeColors const&);
 
-void paint_panel(GUI::Painter&, Gfx::IntRect, Gfx::Bitmap const* background = nullptr);
+void paint_panel(GUI::Painter&, Gfx::IntRect, Gfx::Bitmap const* background = nullptr, bool draw_bevel = true);
 void paint_inset(GUI::Painter&, Gfx::IntRect);
 void paint_button(GUI::Painter&, Gfx::IntRect, bool hovered, bool pressed);
 Gfx::Color parse_color(StringView value, Gfx::Color fallback);

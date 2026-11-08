@@ -37,6 +37,23 @@
 
 namespace GUI {
 
+// Kept OUTSIDE GUI::Window on purpose. The class layout is baked into every
+// client binary through inline accessors, so adding a data member would force
+// a rebuild of the entire app set (old binaries read stale member offsets and
+// crash as soon as widgets are rebuilt, e.g. on a theme switch).
+static HashMap<Window const*, Gfx::Color>& transparent_color_table()
+{
+    static HashMap<Window const*, Gfx::Color> table;
+    return table;
+}
+
+// Same reasoning as the colour key: no new data member on GUI::Window.
+static HashMap<Window const*, bool>& skip_taskbar_table()
+{
+    static HashMap<Window const*, bool> table;
+    return table;
+}
+
 static i32 s_next_backing_store_serial;
 static IDAllocator s_window_id_allocator;
 
@@ -149,6 +166,8 @@ Window::Window(Core::EventReceiver* parent)
 
 Window::~Window()
 {
+    transparent_color_table().remove(this);
+    skip_taskbar_table().remove(this);
     all_windows->remove(this);
     hide();
 }
@@ -228,6 +247,15 @@ void Window::show()
         launch_origin_rect);
     m_visible = true;
     m_visible_for_timer_purposes = true;
+
+    // The colour key is a separate property, deliberately NOT a create_window()
+    // argument: the generated IPC message layout is inlined into every client
+    // binary, so changing it would desync all apps we don't rebuild together.
+    if (auto it = transparent_color_table().find(this); it != transparent_color_table().end())
+        ConnectionToWindowServer::the().async_set_window_transparent_color(m_window_id, Optional<Gfx::Color> { it->value });
+
+    if (skip_taskbar_table().contains(this))
+        ConnectionToWindowServer::the().async_set_window_skip_taskbar(m_window_id, true);
 
     apply_icon();
 
@@ -1011,6 +1039,50 @@ void Window::set_alpha_hit_threshold(float threshold)
     if (!is_visible())
         return;
     ConnectionToWindowServer::the().async_set_window_alpha_hit_threshold(m_window_id, threshold);
+}
+
+void Window::set_transparent_color(Optional<Gfx::Color> const& color)
+{
+    auto& table = transparent_color_table();
+    auto it = table.find(this);
+    if (color.has_value()) {
+        if (it != table.end() && it->value == *color)
+            return;
+        table.set(this, *color);
+    } else {
+        if (it == table.end())
+            return;
+        table.remove(this);
+    }
+    // Before show() the value is picked up at the end of create_window();
+    // afterwards push it as a live property so skin switches apply at once.
+    if (!is_visible())
+        return;
+    ConnectionToWindowServer::the().async_set_window_transparent_color(m_window_id, color);
+    update();
+}
+
+Optional<Gfx::Color> Window::transparent_color() const
+{
+    auto& table = transparent_color_table();
+    auto it = table.find(this);
+    if (it == table.end())
+        return {};
+    return it->value;
+}
+
+void Window::set_skip_taskbar(bool skip)
+{
+    auto& table = skip_taskbar_table();
+    if (skip)
+        table.set(this, true);
+    else
+        table.remove(this);
+    // Before show() the value is applied at the end of create_window();
+    // afterwards push it live, so a window can opt out at any time.
+    if (!is_visible())
+        return;
+    ConnectionToWindowServer::the().async_set_window_skip_taskbar(m_window_id, skip);
 }
 
 void Window::set_hovered_widget(Widget* widget)

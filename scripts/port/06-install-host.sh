@@ -29,7 +29,11 @@ SESSION_USER="${SERENITY_USER:-serenity}"
 SESSION_LANGUAGE="${SERENITY_LANGUAGE:-zh-CN}"
 
 WITH_AUDIO=1
-WITH_IME=1
+# fcitx5 已废弃：新系统的输入法由 /serenity/bin/serenity-engine 直连 librime
+# 提供（SessionManager spawn 的就是它），不再需要 fcitx5、fcitx5-rime、
+# libfcitx5core-dev 或 serenityime addon。默认关掉；下面的旧块只留作历史参考，
+# 不要再启用 -- 它装回来的 fcitx5 会和 serenity-engine 抢 XIM/socket。
+WITH_IME=0
 SWITCH_SESSION=1
 # 会话用户的密码：桌面里按下 sudo / 需要认证的 polkit 操作时要用。没有密码的话
 # 在 Serenity 桌面里什么事都干不了（而且 LoginWindow 也进不去）。
@@ -148,6 +152,7 @@ else
     echo "!! 装一个即可：sudo apt install fonts-noto-cjk" >&2
 fi
 
+# [RETIRED] 以下 fcitx5 安装/配置/addon 逻辑已停用，保留仅供回溯，勿再启用。
 if [[ "${WITH_IME}" == "1" ]]; then
     if ! command -v fcitx5 >/dev/null 2>&1; then
         echo "== 安装 fcitx5（中文输入法）=="

@@ -189,6 +189,8 @@ PlaylistWindow::PlaylistWindow(NonnullRefPtr<PlayerCore> core, Gfx::IntPoint fal
     : m_core(move(core))
 {
     set_title(ByteString { "播放列表" });
+    // Tool window: 千千静听 keeps one taskbar entry (the main window).
+    set_skip_taskbar(true);
     set_obey_widget_min_size(false);
     set_frameless(true);
     set_minimum_size(280, 180);
@@ -244,8 +246,17 @@ void PlaylistWindow::build_ui()
         refresh();
     };
 
-    auto& list_container = root.add<SkinPanel>();
+    // A plain Widget, not a SkinPanel: a nested panel would paint the MAIN
+    // window's skin over the list box (its kind defaults to Main).
+    auto& list_container = root.add<GUI::Widget>();
     list_container.set_layout<GUI::VerticalBoxLayout>(GUI::Margins { 0 }, 0);
+
+    // A native skin only paints the playlist chrome; the rows have to come
+    // from us. Hand the list box to the panel so it stays visible and is
+    // stretched over the skin's <playlist> element instead of being hidden
+    // with the rest of the LibGUI tree (which is why the window looked empty
+    // even with five tracks loaded).
+    root_widget->set_content_widget(list_container, "playlist"sv);
 
     m_scroller = list_container.add<GUI::ScrollableContainerWidget>();
     m_scroller->set_should_hide_unnecessary_scrollbars(true);

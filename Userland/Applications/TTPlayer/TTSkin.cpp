@@ -48,7 +48,7 @@ Gfx::Color parse_color(StringView value, Gfx::Color fallback)
     return Gfx::Color::from_argb(result);
 }
 
-void paint_panel(GUI::Painter& painter, Gfx::IntRect rect, Gfx::Bitmap const* background)
+void paint_panel(GUI::Painter& painter, Gfx::IntRect rect, Gfx::Bitmap const* background, bool draw_bevel)
 {
     auto const& c = colors();
     if (background) {
@@ -60,6 +60,10 @@ void paint_panel(GUI::Painter& painter, Gfx::IntRect rect, Gfx::Bitmap const* ba
     } else {
         painter.fill_rect_with_gradient(Gfx::Orientation::Vertical, rect, c.panel_top, c.panel_bottom);
     }
+    // A colour-keyed skin owns the whole silhouette: an opaque 1px bevel
+    // would draw a frame straight through its transparent corners.
+    if (!draw_bevel)
+        return;
     painter.draw_line(rect.top_left(), rect.top_right().translated(-1, 0), c.bevel_light);
     painter.draw_line(rect.top_left(), rect.bottom_left().translated(0, -1), c.bevel_mid);
     painter.draw_line(rect.bottom_left().translated(1, -1), rect.bottom_right().translated(-1, -1), c.bevel_dark);

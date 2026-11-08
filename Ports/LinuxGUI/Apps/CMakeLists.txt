@@ -223,3 +223,41 @@ set_target_properties(serenity-ime-settings PROPERTIES
 add_executable(serenity-fspicktest ${SERENITY_PROJECT_ROOT}/Ports/LinuxGUI/FsPickTest/main.cpp)
 target_include_directories(serenity-fspicktest PRIVATE ${SERENITY_PROJECT_ROOT}/Userland/Services/FileSystemAccessServer)
 target_link_libraries(serenity-fspicktest PRIVATE LibCore LibFileSystemAccessClient LibGUI LibMain)
+
+# Input method background service (phase 1 skeleton: socket server + line protocol).
+# See HANDOFF_2026-11-07_BRIDGE_IME.md §9. Deliberately listens on a different
+# socket from the live IME so it can be deployed and tested without cutting over.
+add_executable(serenity-ime
+    ${SERENITY_PROJECT_ROOT}/Ports/LinuxGUI/IMEService/main.cpp
+)
+target_link_libraries(serenity-ime PRIVATE
+    LibCore
+    LibMain
+)
+set_target_properties(serenity-ime PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)
+
+# --- IME engine (librime, no fcitx5) ----------------------------------------
+# SessionManager spawns /serenity/bin/serenity-engine. This source file used to
+# exist without any build target: the ISO shipped a session manager referencing
+# a binary that was never compiled. Keep it standalone - it only needs librime
+# and the C++ runtime, none of the Lagom libraries.
+find_package(Threads REQUIRED)
+find_path(RIME_INCLUDE_DIR rime_api.h)
+find_library(RIME_LIBRARY NAMES rime)
+if(RIME_INCLUDE_DIR AND RIME_LIBRARY)
+    add_executable(serenity-engine
+        ${SERENITY_PROJECT_ROOT}/Ports/LinuxGUI/IMEEngine/serenity-engine.cpp
+    )
+    target_include_directories(serenity-engine PRIVATE ${RIME_INCLUDE_DIR})
+    target_link_libraries(serenity-engine PRIVATE ${RIME_LIBRARY} Threads::Threads)
+    # The port-wide -Werror is aimed at Lagom code; this standalone C++ file
+    # is not part of that warning baseline.
+    target_compile_options(serenity-engine PRIVATE -Wno-error)
+    set_target_properties(serenity-engine PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    )
+else()
+    message(WARNING "librime-dev missing: serenity-engine will not be built")
+endif()

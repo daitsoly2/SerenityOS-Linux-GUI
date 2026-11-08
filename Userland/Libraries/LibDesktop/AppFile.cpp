@@ -18,6 +18,7 @@
 #include <LibGUI/Icon.h>
 #include <LibGUI/MessageBox.h>
 #ifndef AK_OS_SERENITY
+#    include <Ports/LinuxGUI/Common/AppIcons.h>
 #    include <Ports/LinuxGUI/Common/hostify.h>
 #endif
 
@@ -207,6 +208,25 @@ static Vector<ByteString> icon_name_candidates(StringView app_name)
 
 GUI::Icon AppFile::icon() const
 {
+#ifndef AK_OS_SERENITY
+    // IconPath= is the Serenity spelling; Icon= is what the Linux port's
+    // shortcut writer emits (and what freedesktop files use). Both may be an
+    // absolute path, an .ico, a theme name or a Windows executable, which is
+    // exactly what the shared resolver understands.
+    auto specification = icon_path();
+    if (specification.is_empty())
+        specification = m_config->read_entry("App", "Icon").trim_whitespace();
+    if (!specification.is_empty()) {
+        GUI::Icon icon;
+        if (auto large = PortIcons::resolve(specification, 32)) {
+            icon.set_bitmap_for_size(32, move(large));
+            if (auto small = PortIcons::resolve(specification, 16))
+                icon.set_bitmap_for_size(16, move(small));
+            return icon;
+        }
+    }
+#endif
+
     auto override_icon = icon_path();
     // FIXME: support pointing to actual .ico files
     if (!override_icon.is_empty())

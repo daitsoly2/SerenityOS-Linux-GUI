@@ -591,23 +591,34 @@ void ExplorerPreviewPane::paint_event(GUI::PaintEvent& event)
         return;
     }
 
-    int const preview_size = min(96, min(area.width() - 8, area.height() / 2));
-    Gfx::IntRect preview_rect { area.center().x() - preview_size / 2, area.y() + 4, preview_size, preview_size };
+    // Vista gives the thumbnail all the room above the details block. The old
+    // hard cap of 96px made a photo unreadable in a 190px pane, and made
+    // widening the pane (drag the splitter) pointless.
+    int const details_height = 22 + 18 * 4 + 12;
+    int const box_height = max(96, area.height() - details_height);
+    Gfx::IntRect preview_box { area.x(), area.y(), area.width(), box_height };
+
     if (m_thumbnail) {
+        painter.fill_rect(preview_box, Color::White);
+        painter.draw_rect(preview_box, Aero::chrome_border());
+        auto inner = preview_box.shrunken(3, 3);
         auto source = m_thumbnail->rect();
-        float scale = min(static_cast<float>(preview_size) / source.width(),
-            static_cast<float>(preview_size) / source.height());
-        Gfx::IntRect fitted { 0, 0, static_cast<int>(source.width() * scale), static_cast<int>(source.height() * scale) };
-        fitted.center_within(preview_rect);
+        float scale = min(static_cast<float>(inner.width()) / source.width(),
+            static_cast<float>(inner.height()) / source.height());
+        // Never upscale past 1:1: blowing a 64px icon up to 200px looks worse
+        // than letting it sit small and centred.
+        scale = min(scale, 1.0f);
+        Gfx::IntRect fitted { 0, 0, max(1, static_cast<int>(source.width() * scale)),
+            max(1, static_cast<int>(source.height() * scale)) };
+        fitted.center_within(inner);
         painter.draw_scaled_bitmap(fitted, *m_thumbnail, source);
-        painter.draw_rect(fitted, Aero::chrome_border());
     } else if (auto const* bitmap = m_icon.bitmap_for_size(48)) {
         Gfx::IntRect icon_rect { 0, 0, 48, 48 };
-        icon_rect.center_within(preview_rect);
+        icon_rect.center_within(preview_box);
         painter.draw_scaled_bitmap(icon_rect, *bitmap, bitmap->rect());
     }
 
-    int y = preview_rect.bottom() + 12;
+    int y = preview_box.bottom() + 12;
     auto draw_line = [&](StringView label, StringView value, bool bold = false) {
         if (y + 18 > area.bottom())
             return;
@@ -629,6 +640,66 @@ void ExplorerPreviewPane::paint_event(GUI::PaintEvent& event)
         draw_line("大小："sv, m_size);
     if (!m_modified.is_empty())
         draw_line("修改时间："sv, m_modified);
+}
+
+// ---------------------------------------------------------------------------
+// ExplorerSplitterHandle
+// ---------------------------------------------------------------------------
+
+void ExplorerSplitterHandle::paint_event(GUI::PaintEvent& event)
+{
+    GUI::Painter painter(*this);
+    painter.add_clip_rect(event.rect());
+    painter.fill_rect(rect(), (m_hovered || m_dragging) ? Aero::nav_hover() : Aero::base());
+    painter.draw_line({ 0, 0 }, { 0, height() - 1 }, Aero::chrome_border());
+}
+
+void ExplorerSplitterHandle::mousedown_event(GUI::MouseEvent& event)
+{
+    if (event.button() != GUI::MouseButton::Primary)
+        return;
+    m_dragging = true;
+    m_origin_x = event.x();
+    if (on_drag_start)
+        on_drag_start();
+    update();
+}
+
+void ExplorerSplitterHandle::mousemove_event(GUI::MouseEvent& event)
+{
+    // LibGUI keeps delivering moves to the pressed widget, so the pointer may be
+    // well outside this 5px strip while dragging; compute from the origin.
+    if (!m_dragging)
+        return;
+    if (on_drag)
+        on_drag(event.x() - m_origin_x);
+}
+
+void ExplorerSplitterHandle::mouseup_event(GUI::MouseEvent& event)
+{
+    if (event.button() != GUI::MouseButton::Primary || !m_dragging)
+        return;
+    m_dragging = false;
+    update();
+    if (on_drag_finished)
+        on_drag_finished();
+}
+
+void ExplorerSplitterHandle::enter_event(Core::Event& event)
+{
+    m_hovered = true;
+    set_override_cursor(Gfx::StandardCursor::ResizeColumn);
+    update();
+    GUI::Widget::enter_event(event);
+}
+
+void ExplorerSplitterHandle::leave_event(Core::Event& event)
+{
+    m_hovered = false;
+    if (!m_dragging)
+        set_override_cursor(Gfx::StandardCursor::None);
+    update();
+    GUI::Widget::leave_event(event);
 }
 
 // ---------------------------------------------------------------------------

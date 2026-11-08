@@ -106,6 +106,10 @@ public:
     Function<void()> on_playlist_change;
     Function<void()> on_volume_change;
     Function<void()> on_eq_change;
+    // Raw decoded audio, before the equalizer. The main window's spectrum
+    // analyzer is the only consumer; leaving it unset costs one branch per
+    // buffer.
+    Function<void(FixedArray<Audio::Sample> const&)> on_audio_buffer;
 
 private:
     struct Biquad {

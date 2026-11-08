@@ -13,3 +13,6 @@
 
 # Prevent port patches from being normalized
 /Ports/**/patches/* -text
+
+# 千千静听皮肤包保持原样（原版 .skn 解出的 XML 用 CRLF，别做归一化）
+/Base/res/ttplayer-skins/** -text
