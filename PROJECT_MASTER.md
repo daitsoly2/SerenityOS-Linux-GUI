@@ -99,9 +99,11 @@ WindowServer: input via libinput
 
 | 文档 | 行数 | 内容 |
 |---|---|---|
+| `README.md` | — | **仓库首页（中文）**：移植说明、截图、能力概览、架构一张图、快速开始、文档导航、许可与派生声明 |
 | `LINUX_GUI_PORT.md` | 989 | 移植技术细节分章：环境、脚本、编译流程、serenitid、登录、翻译/字体、`/serenity` 前缀、汉化、Win 应用、浏览器、输入法、`serenity_compat` 内核模块、Ctrl+Alt+Del、Wayland 客户端、主题桥、输入路径、**§7 上游改动表** |
 
-（`README.md` / `CONTRIBUTING.md` / `SECURITY.md` 是上游 SerenityOS 原文，不在本项目维护范围。）
+（`README.upstream.md` 是上游 SerenityOS 原文留档（作者/特性/构建），`CONTRIBUTING.md` /
+`SECURITY.md` 亦为上游原样，均不在本项目维护范围。）
 
 ### 2.4 组件说明（按需查）
 
@@ -374,6 +376,12 @@ python3 Build/vm/vncshot.py "click:x,y"        # QMP 绝对坐标，比 poke 稳
 
 ### 8.3 Wayland / 合成器
 
+- **「所有 Linux 应用突然都打不开」先查桥，不要先怀疑应用**：`serenity-wlroots-host` 若因缺共享库
+  以 `status 127` 退出，serenitid 退避重启 7 次后打印 `crashed too often, giving up` 并**静默放弃**，
+  之后 WordCraft / gedit / Firefox 全部无窗口、无报错。典型触发：桥用 XIM 前端链了
+  `libxcb-imdkit.so.1`，而 VM 里这个包没装（`apt install libxcb-imdkit1`）。
+  判据：`grep "wayland-host exited" /tmp/serenity-session.log` + `ldd /serenity/bin/serenity-wlroots-host | grep "not found"`。
+  修复后必须 `systemctl restart serenity-desktop.service`（因为已经 give up，杀单个进程不会触发重启）。
 - 键盘焦点是 **seat 级状态**：`keyboard_key()` 只按 `current_keyboard_focus_resource()` 投递；焦点只在 press/map/popup-dismiss 变更（**绝不能在 press/release 之间换焦点**）。
 - 焦点只给 toplevel（先 `surface_topmost_ancestor()`），必须发 `XDG_TOPLEVEL_STATE_ACTIVATED`，且只属于 owning toplevel。
 - 只有调过 `xdg_popup.grab` 的 popup 取焦点（Firefox XUL 菜单**不调** grab）；回滚开关 `SERENITY_POPUP_FOCUS_ALL=1`。

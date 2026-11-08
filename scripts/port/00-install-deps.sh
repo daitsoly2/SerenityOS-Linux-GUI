@@ -20,10 +20,16 @@ apt-get install -y --no-install-recommends \
     libx11-dev libxcomposite-dev libxcursor-dev libxi-dev libxtst-dev \
     libdbus-1-dev libsystemd-dev libwayland-dev libxkbcommon-dev \
     libpixman-1-dev libasound2-dev \
+    libxcb-imdkit-dev libxcb-imdkit1 \
     xvfb
 
+# libxcb-imdkit: serenity-wlroots-host 的 XIM 前端（XimServer）链接它。
+# 缺这个运行时库时桥会以 status 127 退出，七次后 serenitid 放弃重启，
+# 表现为「所有 Wayland/X11 Linux 应用都打不开」——很容易误判成应用本身坏了。
+
 # 可选组件（不参与主构建，按需安装）：
-#   输入法   : sudo apt install fcitx5 fcitx5-chinese-addons libfcitx5core-dev
+#   输入法   : sudo apt install librime-dev   (serenity-engine 直链 librime)
+#   打印     : sudo apt install cups cups-client
 #   内核模块 : sudo apt install linux-headers-$(uname -r)   (KernelModules/serenity_compat)
 #   浏览器   : sudo apt install firefox-esr
 
