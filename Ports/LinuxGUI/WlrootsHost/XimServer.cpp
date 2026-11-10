@@ -47,6 +47,10 @@ RefPtr<Core::Timer> s_pump_timer;
 bool s_focused { false };
 bool s_ws_x11_focus { false };
 xcb_im_input_context_t* s_ic { nullptr };
+/* 仅在 xcb_im_filter_event() 的回调栈内有效。引擎 commit 是在
+ * FORWARD_EVENT 回调里同步产生的，用这个指针回灌比用全局 s_ic 安全：
+ * 客户端异常断开时 imdkit 可能已经把 s_ic 指向的 IC 释放掉。 */
+xcb_im_input_context_t* s_callback_ic { nullptr };
 CaretResolver s_caret_resolver;
 
 uint32_t s_styles[] = {
@@ -88,13 +92,15 @@ Gfx::IntRect caret_screen_rect(xcb_im_input_context_t* ic)
     int y = attr->spot_location.y;
     if (window) {
         const xcb_setup_t* setup = xcb_get_setup(s_conn);
-        xcb_screen_t* screen = xcb_setup_roots_iterator(setup).data;
-        auto cookie = xcb_translate_coordinates(s_conn, window, screen->root,
-            attr->spot_location.x, attr->spot_location.y);
-        if (auto* reply = xcb_translate_coordinates_reply(s_conn, cookie, nullptr)) {
-            x = reply->dst_x;
-            y = reply->dst_y;
-            free(reply);
+        xcb_screen_iterator_t iter = xcb_setup_roots_iterator(setup);
+        if (iter.data) {
+            auto cookie = xcb_translate_coordinates(s_conn, window, iter.data->root,
+                attr->spot_location.x, attr->spot_location.y);
+            if (auto* reply = xcb_translate_coordinates_reply(s_conn, cookie, nullptr)) {
+                x = reply->dst_x;
+                y = reply->dst_y;
+                free(reply);
+            }
         }
     }
     /* 行高：客户端报的 XNArea / XNLineSpace 才是真正的行盒高度。
@@ -118,18 +124,19 @@ Gfx::IntRect caret_screen_rect(xcb_im_input_context_t* ic)
 /* 把 UTF-8 上屏文本转成 COMPOUND_TEXT 后交给 XIM 客户端。 */
 void commit_utf8(char const* text)
 {
-    if (!s_im || !s_ic || !text)
+    // 只认当前回调里的 IC：全局 s_ic 在客户端断开后可能是悬垂指针。
+    if (!s_im || !s_callback_ic || !text)
         return;
     size_t length = 0;
     char* compound = xcb_utf8_to_compound_text(text, strlen(text), &length);
     if (!compound) {
         /* 转换失败时直接用 ISO10646-1 转义 + UTF-8（ibus/fcitx5 同款兜底）。 */
         auto fallback = ByteString::formatted("\033%G{}", text);
-        xcb_im_commit_string(s_im, s_ic, XCB_XIM_LOOKUP_CHARS,
+        xcb_im_commit_string(s_im, s_callback_ic, XCB_XIM_LOOKUP_CHARS,
             fallback.characters(), fallback.length(), 0);
         return;
     }
-    xcb_im_commit_string(s_im, s_ic, XCB_XIM_LOOKUP_CHARS, compound, length, 0);
+    xcb_im_commit_string(s_im, s_callback_ic, XCB_XIM_LOOKUP_CHARS, compound, length, 0);
     free(compound);
     fprintf(stderr, "xim: commit '%s'\n", text);
 }
@@ -187,9 +194,12 @@ void protocol_callback(xcb_im_t*, xcb_im_client_t*, xcb_im_input_context_t* ic,
             : NoSymbol;
         unsigned states = event->state & 0xff;
 
+        /* 引擎在 handle_key() 里同步回 commit，那一下必须用本次回调的 IC。 */
+        s_callback_ic = ic;
         bool handled = keysym != NoSymbol
             ? ImeService::handle_key(static_cast<unsigned>(keysym), states, release)
             : false;
+        s_callback_ic = nullptr;
         if (handled) {
             fprintf(stderr, "xim: key %lu consumed by engine\n",
                 static_cast<unsigned long>(keysym));

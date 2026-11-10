@@ -66,3 +66,9 @@ Ports/LinuxGUI/WlrootsHost/tests/build/
 scripts/port/fcitx5-min.sh
 scripts/port/serenity-ime-daemon.sh
 Ports/LinuxGUI/IMEService/
+
+# 本地临时目录（抽帧、TTS 草稿、封面中间产物）
+.tmp/
+
+# 介绍片等大体积产物只留本地，不进仓库（用 scripts/ 里的脚本重新生成）
+docs/video/

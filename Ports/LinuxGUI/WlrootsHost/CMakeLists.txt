@@ -79,6 +79,11 @@ add_executable(serenity-wlroots-host
     ImeService.cpp
     XimServer.cpp
     wlroots_proto.c
+    # serenity_menu_v1：GTK 菜单交给 WindowServer/Menu.cpp 原生绘制（P0）。
+    # protocol/*.c 由 wayland-scanner private-code 生成，已随源码提交，
+    # 构建机不需要安装 wayland-scanner。
+    serenity_menu_proto.c
+    protocol/serenity-menu-v1-server.c
     # 复用已有且验证过的 X11 侧实现（XWM + rootless Xwayland），不在新桥里
     # 复制一份窗口管理逻辑。这两个文件原在已删除的 WaylandHost 目录。
     ../X11Compat/xwm.cpp

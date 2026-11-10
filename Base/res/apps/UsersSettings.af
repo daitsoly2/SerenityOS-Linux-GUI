@@ -4,4 +4,6 @@ Executable=/bin/UsersSettings
 Category=Settings
 Description=Configure users
 ExcludeFromSystemMenu=true
-RequiresRoot=true
+# 账户写入已交给 root 守护 serenity-hostd，GUI 本身以普通用户运行。
+# 保留 RequiresRoot 会让 AppFile 去找 Serenity 的 /bin/Escalator（Linux 上不存在）。
+RequiresRoot=false

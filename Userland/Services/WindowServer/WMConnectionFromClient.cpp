@@ -43,8 +43,14 @@ void WMConnectionFromClient::set_applet_area_position(Gfx::IntPoint position)
 
     AppletManager::the().set_position(position);
 
-    WindowServer::ConnectionFromClient::for_each_client([](auto& connection) {
-        if (auto result = connection.post_message(Messages::WindowClient::AppletAreaRectChanged(AppletManager::the().window()->rect())); result.is_error()) {
+    // 没有任何 applet 时 AppletManager 不会创建那个窗口（set_position 直接返回），
+    // 这里再解引用就是空指针，整个 WS 会跟着倒。
+    auto* applet_window = AppletManager::the().window();
+    if (!applet_window)
+        return;
+
+    WindowServer::ConnectionFromClient::for_each_client([&](auto& connection) {
+        if (auto result = connection.post_message(Messages::WindowClient::AppletAreaRectChanged(applet_window->rect())); result.is_error()) {
             dbgln("WMConnectionFromClient::set_applet_area_position: {}", result.error());
         }
     });
@@ -99,6 +105,12 @@ void WMConnectionFromClient::start_window_resize(i32 client_id, i32 window_id, i
         return;
     }
     auto& window = *(*it).value;
+    // 和客户端自己的 StartWindowResize 一样要校验方向：越界枚举会一路传到
+    // resize_window() 的 switch 里，命中 VERIFY_NOT_REACHED 就是整个 WS 崩。
+    if (resize_direction < 0 || resize_direction >= (i32)ResizeDirection::__Count) {
+        did_misbehave("WM_StartWindowResize: Bad resize direction");
+        return;
+    }
     // FIXME: We are cheating a bit here by using the current cursor location and hard-coding the left button.
     //        Maybe the client should be allowed to specify what initiated this request?
     WindowManager::the().start_window_resize(window, ScreenInput::the().cursor_location(), MouseButton::Primary, (ResizeDirection)resize_direction);

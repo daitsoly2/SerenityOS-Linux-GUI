@@ -1,0 +1,91 @@
+/*
+ * Serenity "painter" theme -- GTK3 companion stylesheet.
+ *
+ * Same contract as gtk-4.0/gtk.css: NO widget artwork.  Bevels, frames,
+ * scrollbars, checks, tabs and menu panels are painted by
+ * LibGfx::ClassicStylePainter via libserenitypaint.so, injected by the
+ * vendored libgtk-3 shim in gtkrender.c / gtkcssgadget.c.  This file only
+ * supplies the named colours, typography and layout metrics.
+ *
+ * Installed system-wide as /usr/share/themes/Serenity/gtk-3.0/gtk.css so
+ * GTK_THEME=Serenity applies to every GTK3 process (no per-app CSS, no
+ * user-level ~/.config override).
+ */
+
+@define-color theme_bg_color          #d4d0c8;
+@define-color theme_fg_color          #000000;
+@define-color theme_base_color        #ffffff;
+@define-color theme_text_color        #000000;
+@define-color theme_selected_bg_color #000080;
+@define-color theme_selected_fg_color #ffffff;
+@define-color tooltip_bg_color        #ffffe1;
+@define-color tooltip_fg_color        #000000;
+
+/* Typography is read from WindowServer.ini by serenity-ui; these are the
+ * compiled-in defaults and act as the fallback when no ini is available. */
+* {
+  font-family: "Sarasa Gothic SC", "Noto Sans CJK SC", "DejaVu Sans", sans-serif;
+  font-size: 10pt;
+  border-radius: 0;
+  box-shadow: none;
+  text-shadow: none;
+  -GtkWidget-focus-line-width: 1;
+  -GtkWidget-focus-padding: 2;
+}
+
+window, .background, dialog, .dialog { background-color: @theme_bg_color; color: @theme_fg_color; }
+label, .dim-label { color: @theme_fg_color; background-color: transparent; }
+entry, textview, .view, treeview.view, list { background-color: @theme_base_color; color: @theme_text_color; }
+selection, :selected, :selected:focus { background-color: @theme_selected_bg_color; color: @theme_selected_fg_color; }
+
+headerbar, headerbar.titlebar, .titlebar, .toolbar, toolbar, menubar {
+  background-color: @theme_bg_color;
+  background-image: none;
+  color: @theme_fg_color;
+  border-bottom: 1px solid #808080;
+  box-shadow: none;
+}
+headerbar .title, .titlebar .title { font-weight: bold; }
+
+/* Static fallback only: the real menu panel (white + black frame + 24px
+ * stripe) is painted by the shim.  GTK3's popover widget itself DOES run
+ * through gtk_render_background(), so these colours are normally skipped. */
+menu, .menu, .context-menu, popover, popover.background {
+  background-color: @theme_base_color;
+  background-image: none;
+  color: @theme_fg_color;
+  border: 1px solid #000000;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 2px 0;
+}
+popover > contents { box-shadow: none; border-radius: 0; margin: 0; }
+
+/* Menu rows: 24px stripe + 8px inset.  Rows themselves are painted by the
+ * gadget hook (idle = let the panel show through, hover = real selection). */
+menuitem, modelbutton, .menuitem {
+  min-height: 22px;
+  padding: 2px 10px 2px 32px;
+}
+menuitem separator, menu separator, separator {
+  background-color: #808080;
+  min-width: 1px;
+  min-height: 1px;
+}
+
+tooltip, .tooltip { background-color: @tooltip_bg_color; color: @tooltip_fg_color; border: 1px solid #000000; border-radius: 0; }
+
+/* GTK3 legacy geometry -- still honoured by this fork. */
+.scrollbar, scrollbar {
+  -GtkRange-slider-width: 16;
+  -GtkRange-trough-border: 0;
+  -GtkScrollbar-has-backward-stepper: true;
+  -GtkScrollbar-has-forward-stepper: true;
+}
+scrollbar slider { min-width: 16px; min-height: 16px; border-radius: 0; }
+button, entry, .card, .boxed-list, listview > row, .sidebar {
+  border-radius: 0;
+  box-shadow: none;
+  transition: none;
+}
+*:disabled { color: #808080; }

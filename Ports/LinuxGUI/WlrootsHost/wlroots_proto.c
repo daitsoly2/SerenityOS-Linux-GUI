@@ -38,6 +38,9 @@
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_xdg_foreign_registry.h>
+#include <wlr/types/wlr_xdg_foreign_v1.h>
+#include <wlr/types/wlr_xdg_foreign_v2.h>
 #include <wlr/types/wlr_input_method_v2.h>
 #include <wlr/types/wlr_text_input_v3.h>
 #include <wlr/types/wlr_virtual_keyboard_v1.h>
@@ -175,6 +178,14 @@ struct wlroots_proto {
     struct wlr_compositor* compositor;
     struct wlr_shm* shm;
     struct wlr_xdg_shell* xdg_shell;
+    /* xdg-foreign：GTK 在弹 portal 文件对话框之前，必须把父窗口 export 成
+     * "wayland:<token>" 才能传给 portal；没有这两个 global，GTK 会打一行
+     * "Server is missing xdg_foreign support"，然后**静默退回自带的对话框**。
+     * 我们并不真的 import 这个 token（原生对话框不跟随 GTK 窗口），但 export
+     * 必须能成功，否则 GTK 根本不会走 portal。GTK3 用 v1，GTK4 用 v2。 */
+    struct wlr_xdg_foreign_registry* foreign_registry;
+    struct wlr_xdg_foreign_v1* foreign_v1;
+    struct wlr_xdg_foreign_v2* foreign_v2;
     struct wlr_seat* seat;
     /* 虚拟键盘只用来给 seat 提供 xkb keymap，不采集任何物理输入。 */
     struct wlr_keyboard* keyboard;
@@ -1281,6 +1292,17 @@ wlroots_proto* wlroots_proto_create(char const* socket_name,
     if (!p->xdg_shell)
         goto fail;
 
+    /* v1 给 GTK3，v2 给 GTK4 / Firefox；registry 由 display 负责析构。 */
+    p->foreign_registry = wlr_xdg_foreign_registry_create(p->display);
+    if (!p->foreign_registry)
+        goto fail;
+    p->foreign_v2 = wlr_xdg_foreign_v2_create(p->display, p->foreign_registry);
+    if (!p->foreign_v2)
+        goto fail;
+    p->foreign_v1 = wlr_xdg_foreign_v1_create(p->display, p->foreign_registry);
+    if (!p->foreign_v1)
+        goto fail;
+
     p->seat = wlr_seat_create(p->display, "seat0");
     if (!p->seat)
         goto fail;
@@ -1424,6 +1446,34 @@ void wlroots_proto_destroy(wlroots_proto* p)
         free(p->keyboard);
     }
     free(p);
+}
+
+struct wl_display* wlroots_proto_display(wlroots_proto* p)
+{
+    return p ? p->display : NULL;
+}
+
+void* wlroots_proto_surface_from_resource(wlroots_proto* p, struct wl_resource* resource)
+{
+    if (!p || !resource)
+        return NULL;
+    uint32_t id = wl_resource_get_id(resource);
+    int32_t pid = -1;
+    struct wl_client* client = wl_resource_get_client(resource);
+    if (client) {
+        pid_t raw_pid = 0;
+        uid_t uid = 0;
+        gid_t gid = 0;
+        wl_client_get_credentials(client, &raw_pid, &uid, &gid);
+        pid = (int32_t) raw_pid;
+    }
+    struct surface_registry_node* node;
+    wl_list_for_each(node, &p->surfaces, link)
+    {
+        if (node->id == id && (node->pid == -1 || pid == -1 || node->pid == pid))
+            return node->surface;
+    }
+    return NULL;
 }
 
 int wlroots_proto_event_fd(wlroots_proto* p)
@@ -1610,11 +1660,34 @@ static bool text_input_take_focus(struct wlroots_proto* p, struct wlr_text_input
  *   - 已 enable 但还没焦点：尝试拿焦点（覆盖「先 commit enable、后窗口获焦」）
  *   - 已有焦点：把最新状态同步给 IM（客户端改了 surrounding text 等）
  */
+/* GTK4/libadwaita 客户端会对每次 surrounding-text / 光标 / 焦点变化发一次
+ * text_input.commit，无条件 fprintf 会在几分钟内刷出几十万行（实测把
+ * /tmp/serenity-session.log 撑到 100MB / 122 万行）。只在四个关键状态变化时
+ * 打印：调试信息不丢，日志量降到常数级。桥是单实例，状态放文件级 static。 */
+static struct {
+    int enabled;
+    void* focused_surface;
+    void* keyboard_focus_surface;
+    void* input_method;
+    int initialized;
+} s_last_ti_commit;
+
 static void text_input_handle_commit(struct wlroots_proto* p, struct wlr_text_input_v3* ti)
 {
-    fprintf(stderr, "ws-proto: text_input commit enabled=%d focused=%p kb_focus=%p im=%p\n",
-        ti->current_enabled, (void*)ti->focused_surface, (void*)p->keyboard_focus_surface,
-        (void*)p->input_method);
+    if (!s_last_ti_commit.initialized
+        || s_last_ti_commit.enabled != ti->current_enabled
+        || s_last_ti_commit.focused_surface != (void*) ti->focused_surface
+        || s_last_ti_commit.keyboard_focus_surface != (void*) p->keyboard_focus_surface
+        || s_last_ti_commit.input_method != (void*) p->input_method) {
+        fprintf(stderr, "ws-proto: text_input commit enabled=%d focused=%p kb_focus=%p im=%p\n",
+            ti->current_enabled, (void*) ti->focused_surface,
+            (void*) p->keyboard_focus_surface, (void*) p->input_method);
+        s_last_ti_commit.enabled = ti->current_enabled;
+        s_last_ti_commit.focused_surface = (void*) ti->focused_surface;
+        s_last_ti_commit.keyboard_focus_surface = (void*) p->keyboard_focus_surface;
+        s_last_ti_commit.input_method = (void*) p->input_method;
+        s_last_ti_commit.initialized = 1;
+    }
     if (!ti->current_enabled) {
         /* 客户端显式 disable：保留 enter（焦点还在它的 surface 上），
          * 只让上层收掉引擎 context；下次 enable+commit 就能立刻接着用。 */
@@ -1947,6 +2020,24 @@ void wlroots_proto_pointer_motion(wlroots_proto* p, double sx, double sy, uint32
     p->last_pointer_time = time_msec;
     wlr_seat_pointer_notify_motion(p->seat, time_msec, sx, sy);
     wlr_seat_pointer_notify_frame(p->seat);
+}
+
+void wlroots_proto_pointer_motion_to(wlroots_proto* p, void* surface, double sx, double sy, uint32_t time_msec)
+{
+    if (!p || !p->seat || !surface)
+        return;
+    p->last_pointer_time = time_msec;
+    if (p->pointer_focus == surface) {
+        /* 已经是这个 surface 的焦点：直接投 motion。 */
+        wlr_seat_pointer_notify_motion(p->seat, time_msec, sx, sy);
+        wlr_seat_pointer_notify_frame(p->seat);
+    } else {
+        /* 焦点还没落在这个 surface（典型场景：光标刚从 toplevel 跨进刚弹出的
+         * popup）。补发 enter —— wl_pointer.enter 本身携带坐标，客户端据此建立
+         * 该 surface 上的指针焦点，此后 motion/button 才会投给正确的 surface。 */
+        p->pointer_focus = surface;
+        wlr_seat_pointer_notify_enter(p->seat, surface, sx, sy);
+    }
 }
 
 void wlroots_proto_pointer_button(wlroots_proto* p, uint32_t button, bool pressed, uint32_t time_msec)

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=X-GNOME-Metatheme
+Name=Serenity
+Comment=SerenityOS classic look, painted by LibGfx (GTKSerenity control-level fork)
+Encoding=UTF-8
+
+[X-GNOME-Metatheme]
+GtkTheme=Serenity
+IconTheme=Serenity
+CursorTheme=Adwaita

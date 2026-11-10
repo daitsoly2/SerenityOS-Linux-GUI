@@ -17,20 +17,29 @@
  * 统一合成后经 KMS 直出，和原生窗口走同一条已验证干净的路径。
  */
 
+#include <AK/ByteString.h>
 #include <AK/Format.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
+#include <AK/NonnullOwnPtr.h>
 #include <AK/NonnullRefPtr.h>
+#include <AK/Optional.h>
 #include <AK/RefPtr.h>
+#include <AK/StringView.h>
 #include <AK/Vector.h>
 #include <LibCore/EventLoop.h>
 #include <LibCore/Notifier.h>
 #include <LibCore/Timer.h>
 #include <LibGfx/Bitmap.h>
+#include <LibGfx/Point.h>
+#include <LibGfx/Rect.h>
+#include <LibGUI/Action.h>
 #include <LibGUI/Painter.h>
 #include <LibGUI/Application.h>
 #include <LibGUI/Desktop.h>
 #include <LibGUI/Event.h>
+#include <LibGUI/Menu.h>
+#include <LibGUI/Shortcut.h>
 #include <LibGUI/Window.h>
 #include <LibGUI/InputMethod.h>
 #include <LibMain/Main.h>
@@ -40,6 +49,7 @@
 
 #include <drm_fourcc.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -50,17 +60,35 @@
 
 extern "C" {
 #include "wlroots_proto.h"
+#include "serenity_menu_proto.h"
 }
 
 namespace {
 
 static wlroots_proto* s_proto = nullptr;
+static serenity_menu_proto* s_menu_proto = nullptr;
+
+/* serenity_menu_v1 callbacks are defined below `lookup()` / `s_windows`,
+ * because the menu anchor is resolved against the hosted window table.
+ * See Ports/GTKSerenity/WS_MENU_MAPPING.md. */
 
 // Wayland shm 给的是非预乘的 ARGB/XRGB，Gfx::Bitmap 是预乘 BGRA。
 // 和小端 uint32 布局一致（内存字节 B,G,R,A），只差 alpha 语义。
-static void copy_buffer_to_bitmap(void const* pixels, int width, int height, int stride,
+// 返回 false 表示这帧不能安全拷贝（调用方直接丢帧，绝不解引用坏指针）。
+static bool copy_buffer_to_bitmap(void const* pixels, int width, int height, int stride,
     uint32_t format, Gfx::Bitmap& bitmap)
 {
+    if (!pixels || width <= 0 || height <= 0)
+        return false;
+    // 协议层（wl_shm）通常已保证 stride >= width*4，但这里是唯一的像素入口，
+    // 再挡一次很便宜：stride 小于一行时，最后一行会读到映射区之外。
+    if (stride < width * 4)
+        return false;
+    if (format != DRM_FORMAT_ARGB8888 && format != DRM_FORMAT_XRGB8888)
+        return false;
+    if (bitmap.size().width() != width || bitmap.size().height() != height)
+        return false;
+
     bool const opaque = (format == DRM_FORMAT_XRGB8888);
     for (int y = 0; y < height; ++y) {
         auto const* src = reinterpret_cast<uint32_t const*>(
@@ -88,6 +116,7 @@ static void copy_buffer_to_bitmap(void const* pixels, int width, int height, int
             }
         }
     }
+    return true;
 }
 
 static uint32_t now_msec()
@@ -387,7 +416,11 @@ private:
         auto local = to_surface_position(event);
         m_last_pointer_position = local;
         m_has_pointer_position = true;
-        wlroots_proto_pointer_motion(s_proto, local.x(), local.y(), now_msec());
+        /* motion_to 会在焦点还没落在本 surface 时补发 enter（见 wlroots_proto.c）。
+         * 这是 popup hover 修复的关键：光标从 toplevel 跨进刚弹出的 popup 时，
+         * enter_event 因没有坐标无法发 enter，这里首次移动必须补上，否则 motion
+         * 会被投到 toplevel，popup 菜单项永远收不到 PRELIGHT。 */
+        wlroots_proto_pointer_motion_to(s_proto, m_surface, local.x(), local.y(), now_msec());
     }
 
     virtual void mousedown_event(GUI::MouseEvent& event) override
@@ -398,9 +431,8 @@ private:
         m_last_pointer_position = local;
         m_has_pointer_position = true;
         /* 先确保 seat 焦点落在这个 surface 上，否则第一次点击/按键会被吞掉。
-         * enter 之后补一条 motion：客户端只用 motion 更新内部指针位置。 */
-        wlroots_proto_pointer_enter(s_proto, m_surface, local.x(), local.y());
-        wlroots_proto_pointer_motion(s_proto, local.x(), local.y(), now_msec());
+         * motion_to 会在焦点未建立时补发 enter（携带坐标），否则只发 motion。 */
+        wlroots_proto_pointer_motion_to(s_proto, m_surface, local.x(), local.y(), now_msec());
         if (!m_popup_surface)
             wlroots_proto_keyboard_enter(s_proto, m_surface);
         wlroots_proto_pointer_button(s_proto, linux_button(event.button()), true, now_msec());
@@ -593,6 +625,242 @@ static Gfx::IntRect ime_caret_screen_rect(void* surface)
     return { origin.x() + cx, origin.y() + cy, cw, ch };
 }
 
+/* ── serenity_menu_v1 → WindowServer 原生菜单 (P1) ───────────────────────
+ *
+ * GTK4 shim 把纯 GMenuModel 菜单序列化成 serenity_menu_v1 请求，这里还原成
+ * LibGUI 的 Menu/Action。真正的外观（黑框、stripe、hover、分隔线、快捷键列）
+ * 由 WindowServer/Menu.cpp 用 ClassicStylePainter 绘制 —— 与原生 Notepad 菜单
+ * 是同一份代码、同一份 SystemTheme，不需要在客户端复刻像素。
+ *
+ * 协议模块（serenity_menu_proto.c）保持纯 C；所有 LibGUI 对象都活在这里，
+ * 由 s_native_menus 持有强引用，key 是协议层的 serenity_menu_node*。
+ * node_destroy_notify 会先回调 menu_destroy 移除强引用，再 free(node)，所以
+ * Action 的 lambda 捕获 node 在自身生命周期内始终有效。
+ */
+struct NativeMenu {
+    NativeMenu(NonnullRefPtr<GUI::Menu> m, Gfx::IntPoint p, Gfx::IntRect r)
+        : menu(move(m))
+        , screen_position(p)
+        , button_rect(r)
+    {
+    }
+
+    NonnullRefPtr<GUI::Menu> menu;
+    Gfx::IntPoint screen_position;
+    Gfx::IntRect button_rect;
+};
+
+static HashMap<void*, NonnullOwnPtr<NativeMenu>> s_native_menus;
+
+static NativeMenu* native_menu_for(void* menu)
+{
+    auto it = s_native_menus.find(menu);
+    return it == s_native_menus.end() ? nullptr : it->value.ptr();
+}
+
+/* 把 "Ctrl+S" / "Shift+Ctrl+S" 还原成 GUI::Shortcut。
+ * WS 的 add_menu_item 收的是 shortcut 的**显示文本**，而 LibGUI 是从 Shortcut
+ * 对象调 to_byte_string() 生成的 —— 所以必须真正解析，不能直接塞字符串。
+ * 键名反查表直接由 KeyCode.h 的 ENUMERATE_KEY_CODES 宏生成，避免手抄漏项。 */
+struct ShortcutKeyName {
+    char const* name;
+    KeyCode key;
+};
+
+static ShortcutKeyName const s_shortcut_key_names[] = {
+#define __ENUMERATE_KEY_CODE(name, ui_name) { ui_name, Key_##name },
+    ENUMERATE_KEY_CODES
+#undef __ENUMERATE_KEY_CODE
+};
+
+static Optional<GUI::Shortcut> parse_shortcut(char const* text_cstr)
+{
+    if (!text_cstr || !*text_cstr)
+        return {};
+    StringView text { text_cstr, strlen(text_cstr) };
+
+    Vector<StringView, 8> parts;
+    size_t start = 0;
+    for (;;) {
+        auto plus = text.find('+', start);
+        if (!plus.has_value()) {
+            parts.append(text.substring_view(start));
+            break;
+        }
+        parts.append(text.substring_view(start, plus.value() - start));
+        start = plus.value() + 1;
+    }
+
+    u8 modifiers = 0;
+    StringView key_name;
+    for (auto part : parts) {
+        if (part.equals_ignoring_ascii_case("Ctrl"sv)
+            || part.equals_ignoring_ascii_case("Control"sv)
+            || part.equals_ignoring_ascii_case("Primary"sv))
+            modifiers |= Mod_Ctrl;
+        else if (part.equals_ignoring_ascii_case("Shift"sv))
+            modifiers |= Mod_Shift;
+        else if (part.equals_ignoring_ascii_case("Alt"sv))
+            modifiers |= Mod_Alt;
+        else if (part.equals_ignoring_ascii_case("Super"sv)
+            || part.equals_ignoring_ascii_case("Meta"sv))
+            modifiers |= Mod_Super;
+        else
+            key_name = part;
+    }
+    if (key_name.is_empty())
+        return {};
+
+    for (auto const& entry : s_shortcut_key_names) {
+        if (key_name == entry.name)
+            return GUI::Shortcut(modifiers, entry.key);
+    }
+    /* GTK 常用小写单字母（"Ctrl+s"）；KeyCode 表里是大写，规范化后再查一次。 */
+    if (key_name.length() == 1) {
+        char c = key_name[0];
+        if (c >= 'a' && c <= 'z')
+            c -= 'a' - 'A';
+        for (auto const& entry : s_shortcut_key_names) {
+            if (entry.name[0] == c && entry.name[1] == '\0')
+                return GUI::Shortcut(modifiers, entry.key);
+        }
+    }
+    return {};
+}
+
+/* 锚点从 wl_surface 局部坐标换算成屏幕坐标。surface 为空（P1 探针）时，
+ * 客户端给的就是屏幕坐标。查不到宿主窗口时保守回退，绝不让菜单定位崩掉。 */
+static Gfx::IntPoint menu_anchor_origin(struct wl_resource* surface)
+{
+    if (!surface)
+        return {};
+    void* wlr_surface = wlroots_proto_surface_from_resource(s_proto, surface);
+    if (!wlr_surface) {
+        outln("ws-menu: anchor surface not in registry, using raw coordinates");
+        return {};
+    }
+    auto* host = lookup(wlr_surface);
+    if (!host || !host->widget) {
+        outln("ws-menu: anchor surface has no hosted window, using raw coordinates");
+        return {};
+    }
+    return host->widget->screen_relative_rect().location();
+}
+
+static void menu_create(void*, void* menu, struct wl_resource* surface,
+    int x, int y, int anchor_width, int anchor_height)
+{
+    auto position = menu_anchor_origin(surface).translated(x, y);
+    auto button_rect = Gfx::IntRect { position, Gfx::IntSize { anchor_width, anchor_height } };
+    auto native = make<NativeMenu>(GUI::Menu::construct(), position, button_rect);
+    s_native_menus.set(menu, move(native));
+    outln("ws-menu: create_menu at {},{} button={}x{}", x, y, anchor_width, anchor_height);
+}
+
+/* AK::Function 的模板构造带 requires(IsFunctionObject<CallableType>)：传
+ * lvalue lambda 时 CallableType 会推导成 Lambda& 而匹配失败。所以每次都从
+ * prvalue lambda 现场构造，不要先把回调存成变量再按值传。 */
+static Function<void(GUI::Action&)> make_activation_callback(void* menu, uint32_t identifier)
+{
+    return [menu, identifier](GUI::Action&) {
+        serenity_menu_send_activated(menu, identifier);
+        serenity_menu_flush(s_menu_proto);
+        outln("ws-menu: activated id={} -> client", identifier);
+    };
+}
+
+static void menu_add_item(void*, void* menu, uint32_t identifier,
+    char const* text, char const* shortcut, int enabled,
+    int checkable, int checked, void* submenu)
+{
+    auto* native = native_menu_for(menu);
+    if (!native)
+        return;
+    if (submenu)
+        outln("ws-menu: submenu on item '{}' deferred to P2", text);
+
+    /* 每个 Action 自带回调，捕获客户端 identifier。WS 回传的是 Menu 内部
+     * item_id，ConnectionToWindowServer 会用它找到对应 Action 再 activate()，
+     * 所以 identifier 映射天然对齐，不需要额外查表。 */
+    auto parsed = parse_shortcut(shortcut);
+    NonnullRefPtr<GUI::Action> action = [&]() -> NonnullRefPtr<GUI::Action> {
+        if (checkable) {
+            if (parsed.has_value())
+                return GUI::Action::create_checkable(ByteString { text }, parsed.value(), make_activation_callback(menu, identifier));
+            return GUI::Action::create_checkable(ByteString { text }, make_activation_callback(menu, identifier));
+        }
+        if (parsed.has_value())
+            return GUI::Action::create(ByteString { text }, parsed.value(), make_activation_callback(menu, identifier));
+        return GUI::Action::create(ByteString { text }, make_activation_callback(menu, identifier));
+    }();
+    action->set_enabled(enabled);
+    if (checkable)
+        action->set_checked(checked);
+    native->menu->add_action(move(action));
+    outln("ws-menu: add_item id={} '{}' shortcut='{}' enabled={} checked={}",
+        identifier, text, shortcut, enabled, checked);
+}
+
+static void menu_add_separator(void*, void* menu)
+{
+    if (auto* native = native_menu_for(menu))
+        native->menu->add_separator();
+}
+
+static void menu_add_icon(void*, void*, uint32_t identifier,
+    int fd, uint32_t width, uint32_t height, uint32_t stride)
+{
+    outln("ws-menu: add_icon id={} {}x{} stride={} (P3, ignored)",
+        identifier, width, height, stride);
+    if (fd >= 0)
+        close(fd);
+}
+
+static void menu_update_item(void*, void*, uint32_t identifier, int enabled, int checked)
+{
+    /* P2：需要客户端 identifier → Menu 内部 item_id 的映射表。 */
+    outln("ws-menu: update_item id={} enabled={} checked={} (P2, ignored)",
+        identifier, enabled, checked);
+}
+
+static void menu_popup(void*, void* menu, uint32_t serial)
+{
+    (void) serial;
+    auto* native = native_menu_for(menu);
+    if (!native)
+        return;
+    native->menu->popup(native->screen_position, nullptr, native->button_rect);
+    outln("ws-menu: popup -> Menu.cpp at {},{}",
+        native->screen_position.x(), native->screen_position.y());
+}
+
+static void menu_dismiss(void*, void* menu)
+{
+    if (auto* native = native_menu_for(menu))
+        native->menu->dismiss();
+    /* 客户端主动 dismiss 也回一个确认，协议事件回传链路可被探针验证。
+     * WS 侧因外部点击自行关闭菜单的 visibility 回传属于 P2。 */
+    serenity_menu_send_dismissed(menu);
+    serenity_menu_flush(s_menu_proto);
+}
+
+static void menu_destroy(void*, void* menu)
+{
+    s_native_menus.remove(menu);
+    outln("ws-menu: destroy menu={:p}", menu);
+}
+
+static serenity_menu_callbacks const s_menu_callbacks = {
+    .user = nullptr,
+    .create_menu = menu_create,
+    .add_item = menu_add_item,
+    .add_separator = menu_add_separator,
+    .add_icon = menu_add_icon,
+    .update_item = menu_update_item,
+    .popup = menu_popup,
+    .dismiss = menu_dismiss,
+    .destroy = menu_destroy,
+};
 
 /* ── wlroots 协议回调 ──────────────────────────────────────────────────── */
 
@@ -622,7 +890,15 @@ static HostedWindow* ensure_hosted_window(void* surface, char const* title,
     int const slot = static_cast<int>(s_windows.size() % 6);
     int const px = x >= 0 ? x : 80 + slot * 24;
     int const py = y >= 0 ? y : 80 + slot * 24;
-    hosted.window->set_rect({ px, py, w > 0 ? w : 640, h > 0 ? h : 480 });
+    /* X11 客户端可能报一个远大于屏幕的尺寸（也可能只报 1x1）。这里先把初始尺寸
+     * 收敛到桌面范围，真正的尺寸随后由客户端 buffer 的 commit 决定；否则 LibGUI
+     * 会照这个尺寸分配后备位图，桥进程会被 OOM 掉，所有外来窗口一起消失。 */
+    auto const desktop_rect = GUI::Desktop::the().rect();
+    int const max_initial_width = desktop_rect.width() > 0 ? desktop_rect.width() : 1920;
+    int const max_initial_height = desktop_rect.height() > 0 ? desktop_rect.height() : 1080;
+    int const initial_width = w > 0 ? AK::min(w, max_initial_width) : 640;
+    int const initial_height = h > 0 ? AK::min(h, max_initial_height) : 480;
+    hosted.window->set_rect({ px, py, initial_width, initial_height });
     if (frameless)
         hosted.window->set_frameless(true);
     /* 菜单/子表面必须走「带 alpha 的窗口 + 不铺底色」：GTK 的 popover 会在
@@ -727,7 +1003,8 @@ static void on_toplevel_committed(void* surface, void const* pixels, int width, 
             entry->width = width;
             entry->height = height;
         }
-        copy_buffer_to_bitmap(pixels, width, height, stride, format, *entry->bitmap);
+        if (!copy_buffer_to_bitmap(pixels, width, height, stride, format, *entry->bitmap))
+            return;
         /* 窗口尺寸跟随内容层：Firefox 按 wl_output 尺寸渲染内容（实测 1280x885），
          * 而窗口初始是 host 给的 640x480，两者不一致就会只显示左上角一块。
          * 内容层是「纯净内容、无 CSD 阴影」，跟随它不会触发阴影叠加回环。
@@ -766,7 +1043,8 @@ static void on_toplevel_committed(void* surface, void const* pixels, int width, 
         }
     }
 
-    copy_buffer_to_bitmap(pixels, width, height, stride, format, *entry->bitmap);
+    if (!copy_buffer_to_bitmap(pixels, width, height, stride, format, *entry->bitmap))
+        return;
     entry->widget->set_bitmap(*entry->bitmap);
 
     /* popup / subsurface 子窗口：每次提交都重新查询几何并定位（首帧放置、
@@ -797,8 +1075,11 @@ static void on_toplevel_committed(void* surface, void const* pixels, int width, 
 static void on_toplevel_title(void* surface, char const* title, void* user)
 {
     (void)user;
-    if (auto* entry = lookup(surface))
-        entry->window->set_title(ByteString { title });
+    // xdg_toplevel.title 在客户端设置之前是 NULL；直接构造 ByteString 会 strlen(nullptr)。
+    auto* entry = lookup(surface);
+    if (!entry || !entry->window)
+        return;
+    entry->window->set_title(ByteString { title ? title : "" });
 }
 
 
@@ -893,6 +1174,12 @@ static void on_popup_created(void* popup, void* surface, void* toplevel_surface,
 
     auto* entry = ensure_hosted_window(surface, "popup", -1, -1, 1, 1, /*frameless*/ true, grabbing,
         GUI::WindowType::Popup, /*transparent*/ true, /*show_now*/ false);
+    /* 同一个 surface 已经被登记成内容层（协议上不该发生，但输入不可信）：
+     * 这种 entry 没有 window/widget，继续往下会解空指针。 */
+    if (!entry->widget || !entry->window) {
+        outln("wlroots-host: popup surface {:#x} already registered without a window, ignoring", (uintptr_t)surface);
+        return;
+    }
     entry->child = HostedWindow::ChildKind::XdgPopup;
     entry->popup_handle = popup;
     entry->parent_surface = toplevel_surface;
@@ -1017,6 +1304,10 @@ static void on_subsurface_created(void* subsurface, void* surface, void* parent_
 
     auto* entry = ensure_hosted_window(surface, "popup", -1, -1, 1, 1, /*frameless*/ true, /*focus*/ false,
         GUI::WindowType::Popup, /*transparent*/ true, /*show_now*/ false);
+    if (!entry->widget || !entry->window) {
+        outln("wlroots-host: subsurface surface {:#x} already registered without a window, ignoring", (uintptr_t)surface);
+        return;
+    }
     entry->child = HostedWindow::ChildKind::Subsurface;
     entry->subsurface_handle = subsurface;
     entry->parent_surface = parent_surface;
@@ -1409,6 +1700,13 @@ ErrorOr<int> serenity_main(Main::Arguments arguments)
         warnln("wlroots-host: protocol server failed to start");
         return 1;
     }
+
+    /* serenity_menu_v1: register the private global on the same wl_display.
+     * GTK4 shim binds it in P1; absence of the global simply keeps the legacy
+     * xdg_popup drawing path, so this is safe to deploy incrementally. */
+    s_menu_proto = serenity_menu_proto_create(wlroots_proto_display(s_proto), &s_menu_callbacks);
+    if (!s_menu_proto)
+        warnln("wlroots-host: serenity_menu_v1 unavailable (legacy menus remain)");
 
     /* 内建输入法：引擎回调 + 候选窗。引擎（serenityime socket）不在时
      * 全部退化为 no-op，键盘行为与没有输入法完全一致。 */

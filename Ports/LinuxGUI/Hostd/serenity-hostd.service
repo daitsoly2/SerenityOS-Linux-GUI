@@ -1,0 +1,22 @@
+[Unit]
+Description=Serenity Linux host access broker (serenity-hostd)
+Documentation=file:/serenity/share/doc/serenity-hostd
+# 桌面会话里的设置类应用启动时就要能连上这个 socket。
+Before=serenity-desktop.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+Environment=SERENITY_HOSTD_ALLOWED_UID=1000
+# 二进制由 Ports/LinuxGUI/Hostd/build.sh 编译，部署到 /serenity/libexec/。
+# 早期是 /usr/bin/python3 + serenity-hostd.py，已由 C++ 单文件实现取代
+# （原 Python 版的 strip() 会吃掉尾随空字段，导致空密码的 users.add 报“参数个数不对”）。
+ExecStart=/serenity/libexec/serenity-hostd
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -23,11 +23,18 @@ class UsersTab final : public GUI::SettingsWindow::Tab {
 public:
     static ErrorOr<NonnullRefPtr<UsersTab>> try_create();
 
+    // GML 编译器生成的 try_create() 只搭控件树，不会调用这个手写初始化。
+    // 必须由调用方显式执行，否则用户列表、按钮回调全都不会接上。
+    ErrorOr<void> initialize();
+
     virtual void apply_settings() override;
 
 private:
     UsersTab() = default;
-    ErrorOr<void> initialize();
+
+    // GML 生成链路上初始化可能被引发多次；没有这道保护会重复挂占位 label、
+    // 重复绑定按钮回调（点一次 Add User 弹两个对话框）。
+    bool m_initialized { false };
 
     ErrorOr<void> refresh_users();
     ErrorOr<void> add_user();

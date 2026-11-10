@@ -92,7 +92,15 @@ int Menu::content_width() const
     if (widest_shortcut)
         widest_item += padding_between_text_and_shortcut() + widest_shortcut;
 
-    return max(m_minimum_width, max(widest_item, rect_in_window_menubar().width()) + horizontal_padding() + frame_thickness() * 2);
+    int width = max(m_minimum_width, max(widest_item, rect_in_window_menubar().width()) + horizontal_padding() + frame_thickness() * 2);
+
+    /* 宽度来自客户端（最小宽度 + 菜单项文本），必须收敛到屏幕范围内：
+     * ensure_menu_window() 会按这个宽度给内部窗口分配后备位图，而那条路径用的是
+     * release_value_but_fixme_should_propagate_errors()，宽度超限就会直接 abort。 */
+    int max_width = Screen::bounding_rect().width();
+    if (max_width > 0)
+        width = min(width, max_width);
+    return width;
 }
 
 int Menu::item_height() const

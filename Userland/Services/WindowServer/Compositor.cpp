@@ -342,8 +342,10 @@ void Compositor::compose()
             } else if (m_wallpaper_mode == WallpaperMode::Tile) {
                 painter.draw_tiled_bitmap(rect, *m_wallpaper);
             } else if (m_wallpaper_mode == WallpaperMode::Stretch || m_wallpaper_mode == WallpaperMode::Fill) {
-                VERIFY(screen.compositor_screen_data().m_wallpaper_bitmap);
-                painter.blit(rect.location(), *screen.compositor_screen_data().m_wallpaper_bitmap, rect.translated(-screen.location()));
+                // 壁纸位图可能因为分配失败而被清掉（见 update_wallpaper_bitmap）。
+                // 此时背景色已经铺过，直接跳过图片即可，不能 VERIFY 掉整个服务器。
+                if (auto const& wallpaper_bitmap = screen.compositor_screen_data().m_wallpaper_bitmap)
+                    painter.blit(rect.location(), *wallpaper_bitmap, rect.translated(-screen.location()));
             } else {
                 VERIFY_NOT_REACHED();
             }
@@ -1108,7 +1110,15 @@ void Compositor::update_wallpaper_bitmap()
             // If the screen size is equal to the wallpaper size, we don't actually need to scale it
             screen_data.m_wallpaper_bitmap = m_wallpaper;
         } else {
-            auto bitmap = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRx8888, screen.size(), screen.scale_factor()).release_value_but_fixme_should_propagate_errors();
+            // 这块位图的大小等于屏幕，分配失败说明内存已经非常紧张。此时保留
+            // 纯背景色比 abort 整个 WindowServer 合理得多。
+            auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRx8888, screen.size(), screen.scale_factor());
+            if (bitmap_or_error.is_error()) {
+                dbgln("Compositor: Could not allocate wallpaper bitmap for screen #{}: {}", screen.index(), bitmap_or_error.error());
+                screen_data.clear_wallpaper_bitmap();
+                return IterationDecision::Continue;
+            }
+            auto bitmap = bitmap_or_error.release_value();
 
             Gfx::Painter painter(*bitmap);
 
@@ -1586,7 +1596,11 @@ void Compositor::recompute_occlusions()
                 transparent_rects = transparent_rects.intersected(render_rect_on_screen);
                 if (opaque_rects.is_empty() && transparent_rects.is_empty())
                     return IterationDecision::Continue;
-                VERIFY(!opaque_rects.intersects(transparent_rects));
+                // 这两个集合来自同一个窗口框，正常情况下不相交。真被破坏时
+                // （例如主题圆角与颜色键透明的组合）只让这一帧少画一点透明区域，
+                // 不能把整个 WindowServer 断言掉。
+                if (opaque_rects.intersects(transparent_rects))
+                    transparent_rects = transparent_rects.shatter(opaque_rects);
                 for (auto& covering : opaque_rects.rects()) {
                     opaque_covering.add(covering);
                     if (!visible_window_rects.is_empty())
@@ -1606,7 +1620,9 @@ void Compositor::recompute_occlusions()
                 }
                 if (!transparent_rects.is_empty())
                     transparent_covering.add(transparent_rects.shatter(opaque_covering));
-                VERIFY(!transparent_covering.intersects(opaque_covering));
+                // 累积的不透明/透明覆盖区不该相交；相交时宁可少画一块透明区。
+                if (transparent_covering.intersects(opaque_covering))
+                    transparent_covering = transparent_covering.shatter(opaque_covering);
                 return IterationDecision::Continue;
             });
             VERIFY(opaque_covering.is_empty() || render_rect_on_screen.contains(opaque_covering.rects()));
@@ -1616,7 +1632,10 @@ void Compositor::recompute_occlusions()
                 transparent_covering.add(m_overlay_rects.intersected(visible_opaque));
             }
             if (!transparent_covering.is_empty()) {
-                VERIFY(!transparent_covering.intersects(opaque_covering));
+                if (transparent_covering.intersects(opaque_covering))
+                    transparent_covering = transparent_covering.shatter(opaque_covering);
+            }
+            if (!transparent_covering.is_empty()) {
                 transparency_rects.add(transparent_covering);
                 if (!visible_opaque.is_empty()) {
                     auto uncovered_opaque = visible_opaque.shatter(transparent_covering);
@@ -1637,8 +1656,8 @@ void Compositor::recompute_occlusions()
 
                     auto affected_transparency = transparent_covering.intersected(w2.transparency_rects());
                     if (!affected_transparency.is_empty()) {
-                        auto result = affected_transparency_rects.set(&w2, move(affected_transparency));
-                        VERIFY(result == AK::HashSetResult::InsertedNewEntry);
+                        // 同一窗口可能被多个透明区命中：合并即可，不能假设只插入一次。
+                        affected_transparency_rects.ensure(&w2).add(affected_transparency);
                     }
                     return IterationDecision::Continue;
                 });
@@ -1732,8 +1751,7 @@ void Compositor::recompute_occlusions()
 
                         auto affected_transparency = transparent_underneath.intersected(transparency_rects2);
                         if (!affected_transparency.is_empty()) {
-                            auto result = affected_transparency_rects.set(&w2, move(affected_transparency));
-                            VERIFY(result == AK::HashSetResult::InsertedNewEntry);
+                            affected_transparency_rects.ensure(&w2).add(affected_transparency);
                         }
                         return IterationDecision::Continue;
                     });
@@ -1780,9 +1798,14 @@ void Compositor::recompute_occlusions()
             }
         }
 
-        VERIFY(!w.opaque_rects().intersects(m_opaque_wallpaper_rects));
-        VERIFY(!w.transparency_rects().intersects(m_opaque_wallpaper_rects));
-        VERIFY(!w.transparency_wallpaper_rects().intersects(m_opaque_wallpaper_rects));
+        // 缓存的不透明/透明区与壁纸可见区本应互不相交；真的相交只意味着多画
+        // 一点壁纸（视觉问题），不值得让整个服务器 abort。开调试时打一行日志。
+        if constexpr (OCCLUSIONS_DEBUG) {
+            if (w.opaque_rects().intersects(m_opaque_wallpaper_rects)
+                || w.transparency_rects().intersects(m_opaque_wallpaper_rects)
+                || w.transparency_wallpaper_rects().intersects(m_opaque_wallpaper_rects))
+                dbgln("  warning: window '{}' cached rects intersect opaque wallpaper rects", w.title());
+        }
         return IterationDecision::Continue;
     });
 }

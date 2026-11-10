@@ -38,6 +38,11 @@ UI_CALL = re.compile(
 
 STRING = re.compile(r'"((?:[^"\\]|\\.){2,80})"')
 
+# GML 里的文案不走 set_text，而是编译器生成的 setters —— 但运行时同样会进
+# GUI::translate_ui()，所以审计必须把它们算进来（否则「添加用户」这类对话框会
+# 显示成“已覆盖”其实全是英文）。
+GML_TEXT = re.compile(r'^\s*(?:text|title|placeholder|placeholder_text|tooltip)\s*:\s*"((?:[^"\\]|\\.){2,80})"')
+
 # 明显不是文案的：图标 URI、路径、纯格式串、纯标点。
 NOT_TEXT = re.compile(r"^(resource://|/|[a-z0-9_-]+://)")
 
@@ -98,12 +103,21 @@ def scan(path_filter: str | None) -> collections.Counter[str]:
         base = ROOT / root
         if not base.is_dir():
             continue
-        for path in base.rglob("*.cpp"):
+        for path in sorted(base.rglob("*.cpp")) + sorted(base.rglob("*.gml")):
             if path_filter and path_filter.lower() not in str(path).lower():
                 continue
             try:
                 text = path.read_text(encoding="utf-8", errors="ignore")
             except OSError:
+                continue
+            if path.suffix == ".gml":
+                for line in text.splitlines():
+                    match = GML_TEXT.match(line)
+                    if not match:
+                        continue
+                    literal = match.group(1)
+                    if is_candidate(literal):
+                        found[literal] += 1
                 continue
             for line in text.splitlines():
                 if not UI_CALL.search(line):

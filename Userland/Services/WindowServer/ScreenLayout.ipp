@@ -56,7 +56,17 @@ bool ScreenLayout::is_valid(ByteString* error_msg) const
                 *error_msg = ByteString::formatted("Screen #{} has invalid resolution: {}", i, screen.resolution);
             return false;
         }
-        if (screen.scale_factor < 1) {
+        /* 合成器会按 resolution/scale 给每个屏幕分配前后缓冲。上限取 8192
+         * （8K 是 7680x4320），再大就不是“屏幕”而是内存炸弹了。 */
+        constexpr int max_screen_dimension = 8192;
+        if (screen.resolution.width() > max_screen_dimension || screen.resolution.height() > max_screen_dimension) {
+            if (error_msg)
+                *error_msg = ByteString::formatted("Screen #{} resolution is too large: {}", i, screen.resolution);
+            return false;
+        }
+        /* Gfx::Bitmap 只支持 1..4 的缩放因子；scale 更大时 resolution/scale 会变成
+         * 0 尺寸，合成器随后会去建一块 0 尺寸的位图。 */
+        if (screen.scale_factor < 1 || screen.scale_factor > 4) {
             if (error_msg)
                 *error_msg = ByteString::formatted("Screen #{} has invalid scale factor: {}", i, screen.scale_factor);
             return false;

@@ -6,11 +6,12 @@
 
 #include "UsersTab.h"
 #include "Constants.h"
+#include "HostdClient.h"
 #include "UserAddDialog.h"
+#include <AK/Format.h>
 #include <AK/NonnullRefPtr.h>
 #include <AK/String.h>
 #include <LibCore/Account.h>
-#include <LibCore/Command.h>
 #include <LibGUI/AbstractView.h>
 #include <LibGUI/ItemListModel.h>
 #include <LibGUI/Label.h>
@@ -20,6 +21,10 @@ namespace UsersSettings {
 
 ErrorOr<void> UsersTab::initialize()
 {
+    if (m_initialized)
+        return {};
+    m_initialized = true;
+
     m_users_list = *find_descendant_of_type_named<GUI::ListView>("users_list");
     m_add_button = *find_descendant_of_type_named<GUI::Button>("add_button");
     m_delete_button = *find_descendant_of_type_named<GUI::Button>("delete_button");
@@ -77,12 +82,15 @@ ErrorOr<void> UsersTab::initialize()
 
 ErrorOr<void> UsersTab::refresh_users()
 {
-    auto accounts = TRY(Core::Account::all());
+    // 列表走代理：只读 /etc/passwd 的工作放到 root 侧，GUI 不需要 shadow 权限，
+    // 也和「普通用户只能看、不能写」的边界保持一致。
+    auto rows = TRY(hostd_list_users());
+    dbgln("UsersSettings: 从 hostd 载入 {} 个账户", rows.size());
     m_usernames.clear();
-    for (auto& account : accounts) {
-        if (account.uid() < MIN_NORMAL_UID)
-            continue;
-        m_usernames.append(TRY(String::from_byte_string(account.username())));
+    for (auto& row : rows) {
+        auto fields = row.view().split_view('\t');
+        if (!fields.is_empty())
+            m_usernames.append(TRY(String::from_utf8(fields[0])));
     }
     if (m_users_list)
         m_users_list->set_model(*GUI::ItemListModel<String>::create(m_usernames));
@@ -116,7 +124,8 @@ ErrorOr<void> UsersTab::delete_user(StringView username)
     if (result != GUI::MessageBox::ExecResult::Yes)
         return {};
 
-    TRY(Core::command("userdel"sv, { "--remove"sv, username }, {}));
+    // 删除交给 root 代理；它会挡掉系统账户和当前桌面会话用户。
+    TRY(hostd_delete_user(username));
 
     m_details_container->remove_all_children();
     m_user_details_widget = nullptr;

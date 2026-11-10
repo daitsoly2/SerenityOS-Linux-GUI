@@ -482,6 +482,15 @@ void handle_control(int fd)
         send_line(fd, g_active ? "ok active 1 rime" : "ok active 0 keyboard-us");
         return;
     }
+    if (command == "reload") {
+        /* 设置界面写完 custom YAML 后发来。让本进程优雅退出，由 serenitid 的
+         * always_restart 拉起新进程：启动时 initialize_rime() 会强制重新部署，
+         * 新配置才会真正生效。开关状态已经由 publish_status() 落盘，
+         * 重启后 initial_active() 会恢复，不会偷偷变回中文。 */
+        send_line(fd, "ok");
+        g_running = false;
+        return;
+    }
     if (command == "set") {
         // 托盘菜单发 "set <unique>"，设置界面发 "set rime"。只有明确切到键盘
         // 布局才关闭，其余一律当作开启中文输入法。
@@ -594,8 +603,11 @@ void initialize_rime()
 
 int main(int argc, char** argv)
 {
+    /* 数据面 socket 保持固定路径（LibGUI::InputMethod 与桥默认连它）；
+     * 控制面 socket 必须和托盘、设置界面一样从 SERENITY_IME_STATUS_DIR 派生，
+     * 否则一旦会话注入了专用状态目录，托盘发命令会连到一个没人监听的路径。 */
     g_socket_path = "/tmp/serenity-ime.sock";
-    g_ctl_path = "/tmp/serenity-ime-ctl.sock";
+    g_ctl_path = status_dir() + "/serenity-ime-ctl.sock";
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--socket") && i + 1 < argc)
             g_socket_path = argv[++i];

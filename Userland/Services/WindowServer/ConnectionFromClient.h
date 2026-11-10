@@ -207,6 +207,10 @@ private:
 
     Window* window_from_id(i32 window_id);
 
+    // Menubar 保存的是 Menu&（裸引用）：窗口还活着时销毁菜单，必须先把它从
+    // 所有菜单栏里摘掉，否则下一次画标题栏就会解引用悬垂指针。
+    void detach_menu_from_menubars(Menu&);
+
     HashMap<int, NonnullRefPtr<Window>> m_windows;
     HashMap<int, NonnullRefPtr<Menu>> m_menus;
 

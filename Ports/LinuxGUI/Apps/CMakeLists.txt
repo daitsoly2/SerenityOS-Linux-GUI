@@ -261,3 +261,20 @@ if(RIME_INCLUDE_DIR AND RIME_LIBRARY)
 else()
     message(WARNING "librime-dev missing: serenity-engine will not be built")
 endif()
+
+# --- 原生文件选择器 helper（给 xdg-desktop-portal 用） ----------------------
+# serenity-portal 不是 GUI 进程，弹不出 Serenity 的对话框（GUI::FilePicker 需要
+# WindowServer 连接）。所以由它 fork 这个小程序：小程序弹原生选择器，把选中的
+# 路径写 stdout。GTK/Firefox 走 org.freedesktop.portal.FileChooser 时最终落到这里。
+add_executable(serenity-file-picker
+    ${SERENITY_PROJECT_ROOT}/Ports/LinuxGUI/FilePickerHelper/main.cpp
+)
+target_link_libraries(serenity-file-picker PRIVATE
+    LibCore
+    LibGfx
+    LibGUI
+    LibMain
+)
+set_target_properties(serenity-file-picker PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+)

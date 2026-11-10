@@ -4,18 +4,79 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/ByteString.h>
 #include <AK/StdLibExtras.h>
+#include <LibCore/StandardPaths.h>
 #include <LibGUI/Event.h>
 #include <LibGUI/InputMethodCandidateWindow.h>
 #include <LibGUI/Painter.h>
 #include <LibGUI/Window.h>
 #include <LibGfx/Font/Font.h>
 #include <LibGfx/Palette.h>
+#include <stdio.h>
+#include <sys/stat.h>
 
 namespace GUI {
 
+// 只有输入法设置界面会设它，用来在没点「应用」时预览字号；每个进程一份，
+// 桥和普通应用的候选窗永远走配置文件。
+static int s_font_size_preview_override { -1 };
+
+ByteString candidate_font_size_config_path()
+{
+    return ByteString::formatted("{}/.config/serenity/ime-candidate-font-size",
+        Core::StandardPaths::home_directory());
+}
+
+int candidate_font_size()
+{
+    auto path = candidate_font_size_config_path();
+    FILE* file = fopen(path.characters(), "rb");
+    if (!file)
+        return default_candidate_font_size;
+    int size = 0;
+    bool read_ok = fscanf(file, "%d", &size) == 1;
+    fclose(file);
+    // 配置缺失、损坏或越界都退回默认值，绝不把异常字号喂给字体数据库。
+    if (!read_ok || size < min_candidate_font_size || size > max_candidate_font_size)
+        return default_candidate_font_size;
+    return size;
+}
+
+bool set_candidate_font_size(int point_size)
+{
+    if (point_size < min_candidate_font_size || point_size > max_candidate_font_size)
+        return false;
+    auto config_dir = ByteString::formatted("{}/.config", Core::StandardPaths::home_directory());
+    auto app_dir = ByteString::formatted("{}/serenity", config_dir.view());
+    // 目录通常已存在；忽略 EEXIST，只靠后面 fopen 的成败判断可写性。
+    (void)::mkdir(config_dir.characters(), 0700);
+    (void)::mkdir(app_dir.characters(), 0700);
+    auto path = candidate_font_size_config_path();
+    FILE* file = fopen(path.characters(), "wb");
+    if (!file)
+        return false;
+    fprintf(file, "%d\n", point_size);
+    fclose(file);
+    return true;
+}
+
+void set_candidate_font_size_preview_override(int point_size)
+{
+    s_font_size_preview_override = point_size;
+}
+
 void InputMethodPanelWidget::set_content(String preedit, int preedit_cursor, Vector<String> labels, Vector<String> texts, int cursor_index, String aux, bool has_prev, bool has_next)
 {
+    /* 每次刷新候选面板都重读一次字号：设置界面改完「应用」后，下一次打字
+     * 就生效，不必重启应用。用 presentation_size 比一次，避免每次按键都
+     * set_font_size 触发无谓的重排。 */
+    int const point_size = s_font_size_preview_override > 0
+        ? s_font_size_preview_override
+        : candidate_font_size();
+    if (static_cast<int>(font().presentation_size()) != point_size)
+        set_font_size(point_size);
+
     m_preedit = move(preedit);
     m_preedit_cursor = preedit_cursor;
     m_labels = move(labels);

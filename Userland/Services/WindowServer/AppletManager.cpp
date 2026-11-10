@@ -103,6 +103,9 @@ void AppletManager::relayout()
 {
     constexpr int applet_spacing = 4;
     constexpr int applet_window_height = 19;
+    /* m_applets 是 WeakPtr：窗口先于 remove_applet() 消失时这里会出现空项，
+     * 直接解引用就是一次 SIGSEGV。 */
+    m_applets.remove_all_matching([](auto& entry) { return entry.is_null(); });
     int total_width = 0;
     for (auto& existing_applet : m_applets) {
         total_width += max(0, existing_applet->size().width()) + applet_spacing;

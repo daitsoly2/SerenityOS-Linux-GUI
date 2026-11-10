@@ -36,6 +36,16 @@ public:
         layout_menu(menu, window_rect);
     }
 
+    // 菜单即将销毁（或被替换）：先把自己的引用摘掉，免得下一次 paint /
+    // for_each_menu() 碰到已释放的内存。其余菜单保持原布局，避免在没有
+    // window_rect 的情况下重排。
+    void remove_menu(Menu& menu)
+    {
+        if (m_flashed_menu == &menu)
+            m_flashed_menu = nullptr;
+        m_menus.remove_all_matching([&](Menu& existing_menu) { return &existing_menu == &menu; });
+    }
+
     bool flash_menu(Menu* flashed_submenu)
     {
         Menu* const old_flashed_menu = m_flashed_menu;

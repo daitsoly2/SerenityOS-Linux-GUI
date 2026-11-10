@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="serenity_menu_v1">
+
+  <copyright><![CDATA[
+    Copyright (C) 2026 Serenity Linux GUI port
+
+    Private protocol between the vendored GTK4 shim (client) and
+    serenity-wlroots-host (compositor).  It lets a GTK application hand a
+    GMenuModel to WindowServer, which then draws the menu with the very same
+    WindowServer/Menu.cpp that paints native SerenityOS menus.
+
+    Not a public protocol.  Both sides must be deployed together.
+  ]]></copyright>
+
+  <description summary="hand GTK menus to WindowServer">
+    The compositor already owns every window's screen geometry and a
+    WindowServer IPC connection.  This protocol lets a GTK client describe a
+    menu (items, separators, shortcuts, icons, submenus) and have it painted
+    natively by WindowServer instead of rendering it into an xdg_popup
+    surface with a client-side reimplementation of ClassicStylePainter.
+
+    Coordinates are in wl_surface-local space; the compositor translates
+    them to the screen coordinates required by WindowServer.popup_menu.
+  </description>
+
+  <interface name="serenity_menu_manager_v1" version="1">
+    <description summary="create native menus">
+      A singleton global.  If absent, the GTK shim must fall back to drawing
+      the popover itself (the legacy xdg_popup path).
+    </description>
+
+    <request name="create_menu">
+      <arg name="id" type="new_id" interface="serenity_menu_v1"/>
+      <arg name="surface" type="object" interface="wl_surface" allow-null="true"
+           summary="anchor surface; null means use the given coordinates as-is"/>
+      <arg name="x" type="int" summary="anchor x in surface-local coordinates"/>
+      <arg name="y" type="int" summary="anchor y in surface-local coordinates"/>
+      <arg name="anchor_width" type="int"/>
+      <arg name="anchor_height" type="int"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager"/>
+    </request>
+  </interface>
+
+  <interface name="serenity_menu_v1" version="1">
+    <description summary="one native WindowServer menu">
+      Each object maps to one WindowServer menu id.  Items are added before
+      popup(); after popup() the compositor owns input and sends events back.
+    </description>
+
+    <request name="add_item">
+      <arg name="identifier" type="uint" summary="opaque id echoed by events"/>
+      <arg name="text" type="string"/>
+      <arg name="shortcut" type="string" allow-null="true"/>
+      <arg name="enabled" type="uint"/>
+      <arg name="checkable" type="uint"/>
+      <arg name="checked" type="uint"/>
+      <arg name="submenu" type="object" interface="serenity_menu_v1" allow-null="true"/>
+    </request>
+
+    <request name="add_separator"/>
+
+    <request name="add_icon">
+      <description summary="attach an ARGB8888 icon to an item">
+        The fd is a memfd (or any mmap-able fd) holding width*stride bytes.
+        The compositor converts it to Gfx::ShareableBitmap for
+        WindowServer.add_menu_item.
+      </description>
+      <arg name="identifier" type="uint"/>
+      <arg name="fd" type="fd"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="stride" type="uint"/>
+    </request>
+
+    <request name="update_item">
+      <arg name="identifier" type="uint"/>
+      <arg name="enabled" type="uint"/>
+      <arg name="checked" type="uint"/>
+    </request>
+
+    <request name="popup">
+      <arg name="serial" type="uint" summary="input serial that triggered the menu"/>
+    </request>
+
+    <request name="dismiss"/>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the menu and release WS resources"/>
+    </request>
+
+    <event name="activated">
+      <arg name="identifier" type="uint"/>
+    </event>
+
+    <event name="dismissed"/>
+
+    <event name="hovered">
+      <arg name="identifier" type="uint"/>
+      <arg name="entered" type="uint"/>
+    </event>
+  </interface>
+
+</protocol>

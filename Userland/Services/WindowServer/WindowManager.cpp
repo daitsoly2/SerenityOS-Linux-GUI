@@ -2281,6 +2281,12 @@ bool WindowManager::set_theme_override(Core::AnonymousBuffer const& theme_overri
 {
     if (!theme_override.is_valid())
         return false;
+    // PaletteImpl 会把这块缓冲当成 SystemTheme 来读，缓冲过短会让每次取色/取度量
+    // 都读到映射区之外。
+    if (theme_override.size() < sizeof(Gfx::SystemTheme)) {
+        dbgln("WindowManager: Rejecting theme override of {} bytes (expected at least {})", theme_override.size(), sizeof(Gfx::SystemTheme));
+        return false;
+    }
     m_theme_overridden = true;
     Gfx::set_system_theme(theme_override);
     m_palette = Gfx::PaletteImpl::create_with_anonymous_buffer(theme_override);
@@ -2297,9 +2303,16 @@ Optional<Core::AnonymousBuffer> WindowManager::get_theme_override() const
 
 void WindowManager::clear_theme_override()
 {
-    m_theme_overridden = false;
     auto previous_theme_name = g_config->read_entry("Theme", "Name");
-    auto previous_theme = MUST(Gfx::load_system_theme(ByteString::formatted("/res/themes/{}.ini", previous_theme_name), m_preferred_color_scheme));
+    // 配置里的主题文件可能已经不在了（主题改名、只读安装前缀、配置项损坏）。
+    // 重新加载失败不能把整个 WindowServer 带下去。
+    auto previous_theme_or_error = Gfx::load_system_theme(ByteString::formatted("/res/themes/{}.ini", previous_theme_name), m_preferred_color_scheme);
+    if (previous_theme_or_error.is_error()) {
+        dbgln("WindowManager: Could not reload theme '{}': {}", previous_theme_name, previous_theme_or_error.error());
+        return;
+    }
+    auto previous_theme = previous_theme_or_error.release_value();
+    m_theme_overridden = false;
     Gfx::set_system_theme(previous_theme);
     m_palette = Gfx::PaletteImpl::create_with_anonymous_buffer(previous_theme);
     invalidate_after_theme_or_font_change();

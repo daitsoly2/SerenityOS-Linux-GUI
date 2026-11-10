@@ -1,0 +1,144 @@
+/*
+ * Serenity "painter" theme -- GTK4 / libadwaita companion stylesheet.
+ *
+ * THIS IS NOT A WIDGET-LOOK THEME.  It intentionally contains no bevels,
+ * gradients, box-shadows or border-image tricks.  Every control face
+ * (buttons, entries, check/radio, scrollbars, tabs, progress bars, menu
+ * panels) is painted by LibGfx::ClassicStylePainter through
+ * libserenitypaint.so, injected by the vendored libgtk-4 / libadwaita shims
+ * at gtk_widget_create_render_node().  The old serenity-theme-gen.py CSS
+ * tried to draw the Win2000 look itself; those rules fight the real painter
+ * (double borders, grey popovers, 2px padding) and are NOT used here.
+ *
+ * What DOES belong in this file is everything a painter cannot express:
+ *   - the named colours libadwaita hard-depends on (@define-color tokens),
+ *   - typography (font family + size, matched to WindowServer.ini [Fonts]),
+ *   - layout metrics (menu row padding, min-height, label/shortcut spacing),
+ *   - minimal fallback colours for nodes the painter does not own.
+ *
+ * Deploy to BOTH:
+ *   /usr/share/themes/Serenity/gtk-4.0/gtk.css   (GTK_THEME=Serenity)
+ *   ~/.config/gtk-4.0/gtk.css                    (user priority; libadwaita
+ *                                                loads this last, so apps
+ *                                                such as gnome-text-editor
+ *                                                actually see these tokens)
+ */
+
+/* ---- palette -----------------------------------------------------------
+ * Mirrors the compiled-in defaults of serenity-ui (WindowServer.ini derived).
+ * The shim re-declares the @serenity_* tokens at a higher priority at
+ * runtime, so live theme switches keep working. */
+@define-color theme_bg_color        #d4d0c8;
+@define-color theme_fg_color        #000000;
+@define-color theme_base_color      #ffffff;
+@define-color theme_text_color      #000000;
+@define-color theme_selected_bg_color #000080;
+@define-color theme_selected_fg_color #ffffff;
+
+@define-color window_bg_color       #d4d0c8;
+@define-color window_fg_color       #000000;
+@define-color view_bg_color         #ffffff;
+@define-color view_fg_color         #000000;
+@define-color headerbar_bg_color    #d4d0c8;
+@define-color headerbar_fg_color    #000000;
+@define-color headerbar_border_color #808080;
+@define-color headerbar_backdrop_color #d4d0c8;
+@define-color headerbar_shade_color alpha(#808080, 0.2);
+@define-color popover_bg_color      #ffffff;
+@define-color popover_fg_color      #000000;
+@define-color dialog_bg_color       #d4d0c8;
+@define-color dialog_fg_color       #000000;
+@define-color card_bg_color         #d4d0c8;
+@define-color card_fg_color         #000000;
+@define-color card_shade_color      alpha(#808080, 0.1);
+@define-color sidebar_bg_color      #d4d0c8;
+@define-color sidebar_fg_color      #000000;
+@define-color sidebar_backdrop_color #d4d0c8;
+@define-color sidebar_shade_color   alpha(#808080, 0.1);
+@define-color accent_bg_color       #000080;
+@define-color accent_fg_color       #ffffff;
+@define-color accent_color          #000080;
+@define-color destructive_bg_color  #800000;
+@define-color destructive_fg_color  #ffffff;
+@define-color success_bg_color      #008000;
+@define-color warning_bg_color      #808000;
+@define-color error_bg_color        #800000;
+@define-color shade_color           alpha(#808080, 0.1);
+@define-color scrollbar_outline_color #808080;
+
+/* ---- typography --------------------------------------------------------
+ * WindowServer.ini: Default = "Sarasa Gothic SC 10 400 0".  The old theme
+ * named "MS Sans Serif"/"Tahoma" (both absent) and never set a size, so GTK4
+ * fell back to DejaVu Sans at its own default size -- menu rows looked
+ * oversized and CJK/Latin mixed badly. */
+* {
+  font-family: "Sarasa Gothic SC", "Noto Sans CJK SC", "DejaVu Sans", sans-serif;
+  font-size: 10pt;
+}
+
+window, .background { background-color: @window_bg_color; color: @window_fg_color; }
+textview, textview text, .view, list, listview { background-color: @view_bg_color; color: @view_fg_color; }
+label, .dim-label { color: @window_fg_color; background-color: transparent; }
+headerbar, .titlebar, .toolbar { background-color: @headerbar_bg_color; color: @headerbar_fg_color; }
+headerbar .title, .titlebar .title { font-weight: bold; }
+
+/* ---- geometry: no artwork ----------------------------------------------
+ * All of these are LAYOUT only.  Never put background-image, border-color
+ * triples, inset box-shadows or gradients here -- that is the painter's job. */
+window, .background, headerbar, popover, popover > contents, menu, .card,
+.dialog, .view, entry, button, .sidebar, notebook > header, tabbar, .toolbar,
+.osd, checkbutton, radiobutton, scrollbar {
+  border-radius: 0;
+  box-shadow: none;
+  transition: none;
+}
+
+/* ---- popover / menu ----------------------------------------------------
+ * `popover > contents` is a REAL widget (GtkPopoverContent), so the GTK4
+ * shim maps that CSS name to SERENITY_WIDGET_MENU and LibGfx::ClassicStyle-
+ * Painter draws the whole panel there: white base + black frame + 24px
+ * stripe.  Keep the stylesheet transparent -- anything drawn here would be
+ * a second rectangle on top of the painter's output.  The shim's injected
+ * stylesheet (APPLICATION priority) enforces the same, so this is also the
+ * correct fallback when the vendored library is not in use.
+ *
+ * What CSS still owns is the ROW METRICS: without min-height / padding /
+ * border-spacing the menu labels collide with their accelerators, which is
+ * exactly how the old Win2000 stylesheet looked.  A painter cannot express
+ * text layout, so these belong here. */
+popover > contents {
+  background-color: transparent;
+  background-image: none;
+  border-style: none;
+  border-radius: 0;
+  box-shadow: none;
+  margin: 0;
+  padding: 2px 0;
+}
+popover > arrow { background-color: transparent; border-style: none; box-shadow: none; }
+popover.menu > contents { min-width: 220px; }
+
+/* GtkModelButton rows: 24px stripe + 8px text inset on the left.  The
+ * painter owns the row background / hover selection, so this must stay
+ * transparent -- painting a CSS background here would cover it. */
+modelbutton {
+  min-height: 22px;
+  padding: 2px 10px 2px 32px;
+  border-spacing: 16px;
+  border-radius: 0;
+  background-color: transparent;
+  background-image: none;
+  color: @popover_fg_color;
+}
+modelbutton > box > label,
+modelbutton > label { color: @popover_fg_color; }
+modelbutton:disabled { color: #808080; }
+
+/* GTK4 hides overlay scrollbars until hover with opacity: 0.  The classic
+ * desktop always shows a 16px bar. */
+scrollbar { opacity: 1; }
+scrollbar.vertical { min-width: 16px; }
+scrollbar.horizontal { min-height: 16px; }
+
+separator { background-color: #808080; min-width: 1px; min-height: 1px; }
+tooltip { background-color: #ffffe1; color: #000000; border: 1px solid #000000; border-radius: 0; }

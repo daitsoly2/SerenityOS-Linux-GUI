@@ -14,10 +14,12 @@
 #include <LibGUI/Window.h>
 
 #include <errno.h>
-#include <string.h>
 #include <poll.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 namespace ImeService {
@@ -168,6 +170,11 @@ void handle_panel(StringView rest)
     auto preedit = decode_hex(take_token(rest));
     auto candidate_cursor = take_token(rest).to_number<int>().value_or(-1);
     auto count = take_token(rest).to_number<int>().value_or(0);
+    /* 候选数量来自引擎；上限只是防一手协议流损坏导致的巨量分配。 */
+    if (count < 0)
+        count = 0;
+    if (count > 1000)
+        count = 1000;
 
     s_panel.aux = move(aux);
     s_panel.preedit = move(preedit);
@@ -224,9 +231,25 @@ void handle_line(StringView line)
     /* "ok" / "active" / "err …" 不需要动作。 */
 }
 
-/* 读到 handled 为止（一次按键的回复可能是多行 panel + 最后一行 handled）。 */
+/* 读到 handled 为止（一次按键的回复可能是多行 panel + 最后一行 handled）。
+ *
+ * 这是一次同步等待：调用方（protocol_callback）要立刻决定这个键是吞掉还是
+ * 还给客户端。等待本身必须有**总预算**——原来每轮 poll 都等 200ms，引擎一旦
+ * 卡住，桥的事件循环（连同所有窗口的输入）就跟着卡 200ms。
+ * 预算内没回 handled 就按“未消费”处理，按键照常转发。 */
 bool read_until_handled()
 {
+    int timeout_ms = 50;
+    if (auto const* from_env = getenv("SERENITY_IME_TIMEOUT_MS"))
+        timeout_ms = atoi(from_env);
+    if (timeout_ms < 1)
+        timeout_ms = 1;
+    if (timeout_ms > 1000)
+        timeout_ms = 1000;
+
+    timespec start { };
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
     for (;;) {
         for (;;) {
             auto newline = s_read_buffer.find('\n');
@@ -239,9 +262,21 @@ bool read_until_handled()
                 return s_handled_value;
         }
 
+        timespec now { };
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        auto elapsed_ms = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+        auto remaining_ms = timeout_ms - static_cast<int>(elapsed_ms);
+        if (remaining_ms <= 0) {
+            fprintf(stderr, "ime: engine timeout after %dms (no reply to key)\n", timeout_ms);
+            return false;
+        }
+
         pollfd pfd { s_fd, POLLIN, 0 };
-        if (::poll(&pfd, 1, 200) <= 0) {
-            fprintf(stderr, "ime: engine timeout (no reply to key)\n");
+        auto poll_result = ::poll(&pfd, 1, remaining_ms);
+        if (poll_result < 0 && errno == EINTR)
+            continue;
+        if (poll_result <= 0) {
+            fprintf(stderr, "ime: engine timeout after %dms (no reply to key)\n", timeout_ms);
             return false;
         }
         char buffer[4096];
@@ -256,6 +291,13 @@ bool read_until_handled()
         }
         s_read_buffer = ByteString::formatted("{}{}", s_read_buffer.view(),
             StringView { buffer, static_cast<size_t>(count) });
+        /* 引擎在回 handled 之前塞了超过 1MB：协议流已经错位。丢掉缓冲当作
+         * 未处理，否则桥的内存会一直涨，最后被 OOM 杀掉（等于所有窗口陪葬）。 */
+        if (s_read_buffer.length() > (1 << 20)) {
+            fprintf(stderr, "ime: reply buffer overflow, resetting\n");
+            s_read_buffer = {};
+            return false;
+        }
     }
 }
 

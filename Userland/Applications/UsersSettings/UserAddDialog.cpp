@@ -6,10 +6,7 @@
 
 #include "UserAddDialog.h"
 #include "Constants.h"
-#include <LibCore/Account.h>
-#include <LibCore/Command.h>
-#include <LibCore/SecretString.h>
-#include <LibCore/System.h>
+#include "HostdClient.h"
 #include <LibGUI/Button.h>
 #include <LibGUI/Dialog.h>
 #include <LibGUI/ItemListModel.h>
@@ -24,7 +21,7 @@ ErrorOr<void> UserAddDialog::initialize()
     m_username_textbox = find_descendant_of_type_named<GUI::TextBox>("username_textbox");
     m_password_textbox = find_descendant_of_type_named<GUI::PasswordBox>("password_textbox");
 
-    m_account_type_combobox->set_model(*GUI::ItemListModel<StringView, Array<StringView, 2>>::create(ACCOUNT_TYPE_NAMES));
+    m_account_type_combobox->set_model(*GUI::ItemListModel<StringView, Array<StringView, 2>>::create(account_type_names()));
     m_account_type_combobox->set_only_allow_values_from_model(true);
     m_account_type_combobox->set_selected_index(0);
     return {};
@@ -73,31 +70,15 @@ ErrorOr<void> UserAddDialog::add_user()
 {
     auto full_name = TRY(String::from_byte_string(m_full_name_textbox->text()));
     auto username = TRY(String::from_byte_string(m_username_textbox->text()));
-    auto password = Core::SecretString::take_ownership(m_password_textbox->text().to_byte_buffer());
     bool is_admin = m_account_type_combobox->selected_index() == 1;
 
-    // Create user via useradd.
-    if (!full_name.is_empty()) {
-        TRY(Core::command("useradd"sv, { "--create-home"sv, "--gecos"sv, full_name.bytes_as_string_view(), username.bytes_as_string_view() }, {}));
-    } else {
-        TRY(Core::command("useradd"sv, { "--create-home"sv, username.bytes_as_string_view() }, {}));
-    }
-
-    // Update groups and password via Core::Account.
-    auto account = TRY(Core::Account::from_name(username));
-    for (auto group_name : DEFAULT_USER_GROUPS) {
-        auto maybe_group = Core::System::getgrnam(group_name);
-        if (!maybe_group.is_error() && maybe_group.value().has_value())
-            account.add_extra_gid(maybe_group.value()->gr_gid);
-    }
-    if (is_admin) {
-        auto maybe_wheel = Core::System::getgrnam(WHEEL_GROUP_NAME);
-        if (!maybe_wheel.is_error() && maybe_wheel.value().has_value())
-            account.add_extra_gid(maybe_wheel.value()->gr_gid);
-    }
-    TRY(account.set_password(password));
-    TRY(account.sync());
-
+    // 建号、加组、设密码一次性交给 root 代理完成。绝不能再走
+    // Core::Account::sync()：它会按 Serenity 格式重刷 /etc/passwd、
+    // /etc/group、/etc/shadow，足以破坏 Linux 登录。
+    // ByteString 的 view() 在临时量上被 delete（防悬垂视图），先落到局部变量。
+    auto password = m_password_textbox->text();
+    TRY(hostd_add_user(username.bytes_as_string_view(),
+        full_name.bytes_as_string_view(), is_admin, password.view()));
     return {};
 }
 

@@ -21,6 +21,7 @@
 //   Restart=yes               ; restart crashed children (default yes)
 
 #include <AK/ByteString.h>
+#include <errno.h>
 #include <AK/Format.h>
 #include <AK/LexicalPath.h>
 #include <AK/NonnullOwnPtr.h>
@@ -560,6 +561,14 @@ ErrorOr<int> serenity_main(Main::Arguments)
                 fclose(f);
             }
         }
+    // 必须主动把 portal 拉起来，不能只靠 D-Bus 激活：GTK 用
+    // G_DBUS_PROXY_FLAGS_DO_NOT_AUTO_START 建 org.freedesktop.portal.Desktop 代理，
+    // 应用启动那一瞬若这个名字还无人占，GTK 就**永久**退回自带的 GtkFileChooser，
+    // 在这个桌面上表现为点「浏览…」没有任何反应（连对话框都不弹）。
+    // 让 portal 和 dbus-daemon 一起随会话启动，名字在任何 Linux 应用之前就归我们。
+    auto portal_child = make_child(ByteString { "portal" }, ByteString { "serenity-portal" }, {}, true);
+    portal_child->always_restart = true;
+    g_children.append(move(portal_child));
     }
     // Audio: AudioServer mixes into /dev/audio/0 (serenity_compat), the bridge
     // forwards that PCM to the host's sound card. Without the compat module the
@@ -618,6 +627,28 @@ ErrorOr<int> serenity_main(Main::Arguments)
         setenv("MOZ_ENABLE_WAYLAND", "1", 0);
         setenv("GDK_BACKEND", "wayland,x11", 0);
         setenv("QT_QPA_PLATFORM", "wayland;xcb", 0);
+        // 文件选择走 xdg-desktop-portal，落到我们自己的 serenity-portal，最终弹出
+        // Serenity 原生 FilePicker。GTK4 的 GtkFileChooserNative 默认就走 portal，
+        // GTK3 只有设了这个变量才会走（否则弹它自带的 GtkFileChooserDialog）。
+        setenv("GTK_USE_PORTAL", "1", 0);
+        // 老式 GtkFileChooserDialog（gedit 等）根本不走 portal，GTK_USE_PORTAL 对它
+        // 无效。这套系统不跟随上游 GTK，所以直接在符号层定制 GTK3 运行时：
+        // 注入 LD_PRELOAD 覆盖 gtk_dialog_run()，把文件选择器重定向到原生
+        // FilePicker。等价于在 gtk/gtkdialog.c:gtk_dialog_run() 开头加分支，
+        // 但不用 fork 整个 GTK3 源码树、不用改系统 libgtk-3.so.0、可随时回滚。
+        // 追加而非覆盖已有的 LD_PRELOAD，且库本身靠 SERENITY_NATIVE_FILE_CHOOSER
+        // 开关，未设时行为与未定制完全一致。
+        {
+            char const* shim = "/serenity/lib/libserenity-gtk3-dialog.so";
+            char const* existing = getenv("LD_PRELOAD");
+            if (!existing || !strstr(existing, shim)) {
+                auto preload = (existing && *existing)
+                    ? ByteString::formatted("{} {}", existing, shim)
+                    : ByteString { shim };
+                setenv("LD_PRELOAD", preload.characters(), 1);
+            }
+            setenv("SERENITY_NATIVE_FILE_CHOOSER", "1", 0);
+        }
         // Qt has no process-global stylesheet env var, so use Fusion rather
         // than whatever platform default the no-DESKTOP_SESSION session picks.
         // The generated palette lives in /usr/share/serenity for qt5ct/qt6ct
@@ -646,28 +677,50 @@ ErrorOr<int> serenity_main(Main::Arguments)
         (void)0;
     }
 
-    // Input method: fcitx5 runs as a session child. LibGUI text widgets reach
-    // it through the serenityime addon's unix socket (LibGUI/InputMethod.cpp);
-    // GTK/Qt/X11 clients use fcitx's own IM modules. D-Bus is started before
-    // this child, so restart it on exit: a one-shot fcitx5 that exits (even
-    // cleanly, for example after `fcitx5 -r`) must not leave the session with
-    // no input method. The X_OK filter below drops it entirely when fcitx5 is
-    // not installed.
+    // 输入法：serenity-engine 直链 librime。原生 Serenity 应用走
+    // LibGUI::InputMethod 的 socket，GTK/Qt/X11 客户端走 Wayland text-input-v3
+    // 或 XIM，由桥转发到同一个引擎。
     {
+        // 统一 IME 状态目录：托盘（serenity-shell）、设置界面、引擎都从
+        // SERENITY_IME_STATUS_DIR 派生 status/methods 文件和控制 socket。
+        // 不显式注入时三方各自猜 /tmp，任何一侧改默认值就会静默失联
+        // （表现＝托盘永远显示 EN、设置界面开关不生效）。
+        auto const* runtime_dir = getenv("XDG_RUNTIME_DIR");
+        auto ime_status_dir = ByteString::formatted("{}/serenity-ime",
+            (runtime_dir && *runtime_dir) ? runtime_dir : "/tmp");
+        if (mkdir(ime_status_dir.characters(), 0700) != 0 && errno != EEXIST) {
+            // 运行时目录不可用就退回 /tmp，至少让托盘还能读到状态。
+            ime_status_dir = "/tmp";
+        }
+        setenv("SERENITY_IME_STATUS_DIR", ime_status_dir.characters(), 1);
+
         // GTK/Qt 必须走**原生 Wayland IM**（zwp_text_input_v3），才会创建
         // text_input 并连到 serenity-ime 服务。设成 "fcitx" 会去连 fcitx5 的
         // GTK/Qt IM 模块，而定制版 fcitx5 已裁掉 dbus/waylandim ⇒ 连不上、
         // 键被吞，表现为「gedit 完全不能输入」。
         unsetenv("GTK_IM_MODULE");
         unsetenv("QT_IM_MODULE");
-        setenv("XMODIFIERS", "@im=serenity", 0);
-        // XIM needs the X server Wine and other X11 clients actually use.
-        setenv("DISPLAY", ":100", 0);
+        // 用覆盖写：外部 /etc/environment 里若残留 fcitx/ibus 的 XMODIFIERS
+        // 或别的 DISPLAY，X11 客户端就会连到不存在的服务，完全打不了字。
+        setenv("XMODIFIERS", "@im=serenity", 1);
+        setenv("DISPLAY", ":100", 1);
+
+        // 把会话变量推给 systemd --user 与 D-Bus 激活环境，这样「不是桌面
+        // 后代」的 Linux 应用（user unit、D-Bus 激活的服务）也自动带上输入法
+        // 配置，不必在 Linux 侧逐一手写。命令不存在或调用失败都无关紧要。
+        (void)system("/usr/bin/dbus-update-activation-environment --systemd "
+            "DISPLAY XMODIFIERS WAYLAND_DISPLAY SERENITY_IME_STATUS_DIR "
+            "GDK_BACKEND QT_QPA_PLATFORM XDG_CURRENT_DESKTOP "
+            "GTK_USE_PORTAL LD_PRELOAD SERENITY_NATIVE_FILE_CHOOSER >/dev/null 2>&1");
+
         // 引擎＝serenity-engine（直链 librime）。fcitx5 已退役：它在这套架构里
         // 只负责「加载 rime」，却带来 34 个包、一个必须靠 shell 脚本守护的进程，
-        // 以及 unload 时的析构崩溃。引擎是普通进程，掉线由 make_child 的
-        // always_restart 拉回，不再需要守护脚本。
-        g_children.append(make_child(ByteString { "ime" }, ByteString { "/serenity/bin/serenity-engine" }, {}, true));
+        // 以及 unload 时的析构崩溃。
+        auto ime_child = make_child(ByteString { "ime" }, ByteString { "/serenity/bin/serenity-engine" }, {}, true);
+        // 设置界面写完 custom YAML 会发 reload 让引擎「正常退出」重新部署；
+        // 正常退出也必须拉回，否则会话从此没有输入法。
+        ime_child->always_restart = true;
+        g_children.append(move(ime_child));
     }
 
     // One shell process: desktop (wallpaper + icons) and taskbar (start menu,

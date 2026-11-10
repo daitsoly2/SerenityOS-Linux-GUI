@@ -22,6 +22,7 @@
 #include <WindowServer/WindowSwitcher.h>
 #include <errno.h>
 #include <stdio.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace WindowServer {
@@ -92,8 +93,35 @@ void ConnectionFromClient::notify_about_new_screen_rects()
     async_screen_rects_changed(Screen::rects(), Screen::main().index(), wm.window_stack_rows(), wm.window_stack_columns());
 }
 
+void ConnectionFromClient::detach_menu_from_menubars(Menu& menu)
+{
+    // Menubar 里存的是 Menu&（裸引用），菜单销毁前必须先从所有菜单栏摘掉，
+    // 否则下次画标题栏就会走到已释放的对象上。
+    for (auto& [_, window] : m_windows) {
+        bool contained = false;
+        window->menubar().for_each_menu([&](Menu& other_menu) {
+            if (&other_menu == &menu) {
+                contained = true;
+                return IterationDecision::Break;
+            }
+            return IterationDecision::Continue;
+        });
+        if (!contained)
+            continue;
+        window->menubar().remove_menu(menu);
+        window->invalidate_menubar();
+    }
+}
+
 void ConnectionFromClient::create_menu(i32 menu_id, String const& name, i32 minimum_width)
 {
+    // 复用同一个 menu_id 会替换掉旧的 Menu 对象，先把它从所有菜单栏摘掉，
+    // 否则菜单栏会继续指向即将销毁的对象。
+    if (auto existing = m_menus.get(menu_id); existing.has_value()) {
+        detach_menu_from_menubars(*existing.value());
+        existing.value()->close();
+        m_menus.remove(menu_id);
+    }
     auto menu = Menu::construct(this, menu_id, name, minimum_width);
     m_menus.set(menu_id, move(menu));
 }
@@ -146,9 +174,11 @@ void ConnectionFromClient::destroy_menu(i32 menu_id)
         return;
     }
     auto& menu = *(*it).value;
+    // 先摘菜单栏、再 close、最后移出并销毁；remove_child() 要在对象还活着时调用。
+    detach_menu_from_menubars(menu);
     menu.close();
-    m_menus.remove(it);
     remove_child(menu);
+    m_menus.remove(it);
 }
 
 void ConnectionFromClient::add_menu(i32 window_id, i32 menu_id)
@@ -375,7 +405,12 @@ void ConnectionFromClient::set_wallpaper_mode(ByteString const& mode)
 
 Messages::WindowServer::GetWallpaperResponse ConnectionFromClient::get_wallpaper()
 {
-    return Compositor::the().wallpaper_bitmap()->to_shareable_bitmap();
+    // 没有壁纸是合法状态（既没配 Background/Color 也没有图片）。
+    // 返回空 ShareableBitmap，客户端那边不会解空指针，我们这边也不会。
+    auto wallpaper = Compositor::the().wallpaper_bitmap();
+    if (!wallpaper)
+        return { Gfx::ShareableBitmap() };
+    return wallpaper->to_shareable_bitmap();
 }
 
 Messages::WindowServer::SetScreenLayoutResponse ConnectionFromClient::set_screen_layout(ScreenLayout const& screen_layout, bool save)
@@ -598,6 +633,13 @@ void ConnectionFromClient::set_window_minimum_size(i32 window_id, Gfx::IntSize s
         return;
     }
 
+    // 同 CreateWindow：最小尺寸会流进 Window::set_rect()，再进窗口框的位图分配，
+    // 所以同样需要这条上限。
+    if (size.width() < 0 || size.height() < 0 || size.width() > INT16_MAX || size.height() > INT16_MAX) {
+        did_misbehave("SetWindowMinimumSize with bad size");
+        return;
+    }
+
     auto system_window_minimum_size = calculate_minimum_size_for_window(window);
     window.set_minimum_size({ max(size.width(), system_window_minimum_size.width()),
         max(size.height(), system_window_minimum_size.height()) });
@@ -675,6 +717,16 @@ void ConnectionFromClient::create_window(i32 window_id, i32 process_id, Gfx::Int
 
     if (m_windows.contains(window_id)) {
         did_misbehave("CreateWindow with already-used window ID");
+        return;
+    }
+
+    // 窗口框会按窗口矩形缓存位图（WindowFrame::paint() 用的是
+    // release_value_but_fixme_should_propagate_errors()），而最小尺寸又会被套到
+    // 该矩形上。这里统一设上限，免得单个客户端就能让这些分配失败。
+    if (rect.width() > INT16_MAX || rect.height() > INT16_MAX
+        || minimum_size.width() < 0 || minimum_size.height() < 0
+        || minimum_size.width() > INT16_MAX || minimum_size.height() > INT16_MAX) {
+        did_misbehave("CreateWindow with bad window sizing");
         return;
     }
 
@@ -804,8 +856,28 @@ void ConnectionFromClient::set_window_backing_store(i32 window_id, [[maybe_unuse
     if (window.last_backing_store() && window.last_backing_store_serial() == serial) {
         window.swap_backing_stores();
     } else {
+        // 下面这些值全部来自客户端，而 Gfx::Bitmap 并不会校验匿名缓冲的实际大小
+        // 是否够放下这个几何尺寸：pitch 与 size 不匹配时，合成器会拿到一块指向
+        // 映射区之外的位图（首次绘制就 SIGBUS），或者让 Bitmap::create 直接失败。
+        // 这两件事都不能由单个客户端触发。
+        if (size.width() <= 0 || size.height() <= 0
+            || size.width() > INT16_MAX || size.height() > INT16_MAX) {
+            did_misbehave("SetWindowBackingStore: Bad bitmap size");
+            return;
+        }
+        // BGRA8888 与 BGRx8888 都是 4 字节/像素。
+        if (pitch < size.width() * 4) {
+            did_misbehave("SetWindowBackingStore: Pitch smaller than a row");
+            return;
+        }
+        i64 const required_size = static_cast<i64>(pitch) * size.height();
+        struct stat stat_buffer { };
+        if (fstat(anon_file.fd(), &stat_buffer) != 0 || stat_buffer.st_size < required_size) {
+            did_misbehave("SetWindowBackingStore: Backing store is smaller than the bitmap it describes");
+            return;
+        }
         // FIXME: Plumb scale factor here eventually.
-        auto buffer_or_error = Core::AnonymousBuffer::create_from_anon_fd(anon_file.take_fd(), pitch * size.height());
+        auto buffer_or_error = Core::AnonymousBuffer::create_from_anon_fd(anon_file.take_fd(), required_size);
         if (buffer_or_error.is_error()) {
             did_misbehave("SetWindowBackingStore: Failed to create anonymous buffer for window backing store");
             return;
@@ -816,10 +888,20 @@ void ConnectionFromClient::set_window_backing_store(i32 window_id, [[maybe_unuse
             size,
             1);
         if (backing_store_or_error.is_error()) {
-            did_misbehave("");
+            did_misbehave("SetWindowBackingStore: Failed to create bitmap for window backing store");
+            return;
         }
         window.set_backing_store(backing_store_or_error.release_value(), serial);
     }
+    // 合成器用这个尺寸算 blit 矩形，必须落在当前后备存储的真实范围内
+    // （swap 分支里实际生效的是另一块 bitmap，不能拿这次的 size 当依据）。
+    auto* current_store = window.backing_store();
+    if (!current_store)
+        return;
+    auto const store_size = current_store->size();
+    if (visible_size.width() < 0 || visible_size.height() < 0
+        || visible_size.width() > store_size.width() || visible_size.height() > store_size.height())
+        visible_size = store_size;
     window.set_backing_store_visible_size(visible_size);
 
     if (flush_immediately)
@@ -953,7 +1035,10 @@ Messages::WindowServer::StartDragResponse ConnectionFromClient::start_drag(ByteS
 void ConnectionFromClient::set_accepts_drag(bool accepts)
 {
     auto& wm = WindowManager::the();
-    VERIFY(wm.dnd_client());
+    // 拖放可能已经结束（也可能根本是另一个客户端的）。这只是一条建议性通知，
+    // 忽略即可，不能为了它把整个 WindowServer VERIFY 掉。
+    if (wm.dnd_client() != this)
+        return;
     wm.set_accepts_drag(accepts);
 }
 
@@ -1265,19 +1350,25 @@ Messages::WindowServer::GetScreenBitmapResponse ConnectionFromClient::get_screen
         return bitmap.to_shareable_bitmap();
     }
     // TODO: Mixed scale setups at what scale? Lowest? Highest? Configurable?
-    auto bitmap_size = rect.value_or(Screen::bounding_rect()).size();
-    if (auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRx8888, bitmap_size, 1); !bitmap_or_error.is_error()) {
+    // 请求区域由客户端给定：先和所有屏幕的包围盒求交。既把 30000x30000 这种
+    // 请求挡在几 GB 分配之前，也让下面每个屏幕的目标坐标相对“请求区域原点”算，
+    // 而不是相对屏幕绝对坐标（原来 rect 带偏移时截图内容会整体错位）。
+    auto bounds = Screen::bounding_rect();
+    auto requested_rect = rect.value_or(bounds).intersected(bounds);
+    if (requested_rect.is_empty())
+        return { Gfx::ShareableBitmap() };
+    if (auto bitmap_or_error = Gfx::Bitmap::create(Gfx::BitmapFormat::BGRx8888, requested_rect.size(), 1); !bitmap_or_error.is_error()) {
         auto bitmap = bitmap_or_error.release_value_but_fixme_should_propagate_errors();
         Gfx::Painter painter(*bitmap);
         Screen::for_each([&](auto& screen) {
             auto screen_rect = screen.rect();
-            if (rect.has_value() && !rect.value().intersects(screen_rect))
+            auto src_rect = requested_rect.intersected(screen_rect);
+            if (src_rect.is_empty())
                 return IterationDecision::Continue;
-            auto src_rect = rect.has_value() ? rect.value().intersected(screen_rect) : screen_rect;
-            VERIFY(Screen::bounding_rect().contains(src_rect));
             auto& screen_bitmap = Compositor::the().front_bitmap_for_screenshot({}, screen);
             // TODO: painter does *not* support down-sampling!!!
-            painter.blit(screen_rect.location(), screen_bitmap, src_rect.translated(-screen_rect.location()), 1.0f, false);
+            painter.blit(src_rect.location() - requested_rect.location(), screen_bitmap,
+                src_rect.translated(-screen_rect.location()), 1.0f, false);
             return IterationDecision::Continue;
         });
         return bitmap->to_shareable_bitmap();
@@ -1293,6 +1384,12 @@ Messages::WindowServer::GetScreenBitmapAroundCursorResponse ConnectionFromClient
 Messages::WindowServer::GetScreenBitmapAroundLocationResponse ConnectionFromClient::get_screen_bitmap_around_location(Gfx::IntSize size, Gfx::IntPoint location)
 {
     // TODO: Mixed scale setups at what scale? Lowest? Highest? Configurable?
+    // 尺寸完全由客户端决定。先挡住非正数，再收敛到屏幕包围盒，否则
+    // 这里会按请求尺寸去分配位图（几 GB 起步）。
+    auto bounds = Screen::bounding_rect();
+    if (size.width() <= 0 || size.height() <= 0 || bounds.is_empty())
+        return { {} };
+    size = { min(size.width(), bounds.width()), min(size.height(), bounds.height()) };
     Gfx::Rect rect { location.x() - (size.width() / 2), location.y() - (size.height() / 2), size.width(), size.height() };
 
     // Recompose the screen to make sure the cursor is painted in the location we think it is.
@@ -1425,6 +1522,22 @@ void ConnectionFromClient::set_window_parent_from_client(i32 client_id, i32 pare
     if (!parent_window) {
         did_misbehave("SetWindowParentFromClient: Bad parent window ID");
         return;
+    }
+
+    // Window::set_parent_window() 每个窗口只能调一次；再设一次父窗口还会让
+    // destroy_window() 无限递归。
+    if (child_window->parent_window()) {
+        did_misbehave("SetWindowParentFromClient: Child window already has a parent");
+        return;
+    }
+
+    // 拒绝成环（A 是 B 的父窗口，同时 B 又是 A 的祖先）。否则所有祖先遍历
+    // ——包括 for_each_window_in_modal_chain() 和窗口销毁——都不会终止。
+    for (auto* ancestor = parent_window; ancestor; ancestor = ancestor->parent_window()) {
+        if (ancestor == child_window) {
+            did_misbehave("SetWindowParentFromClient: Would create a parent cycle");
+            return;
+        }
     }
 
     if (parent_window->is_stealable_by_client(this->client_id())) {

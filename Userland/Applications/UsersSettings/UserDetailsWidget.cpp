@@ -7,8 +7,9 @@
 #include "UserDetailsWidget.h"
 #include "ChangePasswordDialog.h"
 #include "Constants.h"
+#include "HostdClient.h"
 #include <AK/String.h>
-#include <LibCore/SecretString.h>
+#include <LibCore/Account.h>
 #include <LibCore/System.h>
 #include <LibGUI/Dialog.h>
 #include <LibGUI/ItemListModel.h>
@@ -63,12 +64,16 @@ ErrorOr<void> UserDetailsWidget::initialize(Core::Account const& account)
     m_home_dir_textbox->set_text(account.home_directory());
     m_uid_gid_textbox->set_text(ByteString::formatted("{} / {}", account.uid(), account.gid()));
 
-    // Check wheel group membership to determine admin status.
+    // Linux 上管理员组是 sudo（或 wheel），取宿主机实际存在的那个来回显。
     bool is_admin = false;
-    auto maybe_wheel = Core::System::getgrnam(WHEEL_GROUP_NAME);
-    if (!maybe_wheel.is_error() && maybe_wheel.value().has_value())
-        is_admin = account.extra_gids().contains_slow(maybe_wheel.value()->gr_gid);
-    m_account_type_combobox->set_model(*GUI::ItemListModel<StringView, Array<StringView, 2>>::create(ACCOUNT_TYPE_NAMES));
+    for (auto group_name : ADMIN_GROUP_NAMES) {
+        auto maybe_group = Core::System::getgrnam(group_name);
+        if (maybe_group.is_error() || !maybe_group.value().has_value())
+            continue;
+        is_admin = account.extra_gids().contains_slow(maybe_group.value()->gr_gid);
+        break;
+    }
+    m_account_type_combobox->set_model(*GUI::ItemListModel<StringView, Array<StringView, 2>>::create(account_type_names()));
     m_account_type_combobox->set_only_allow_values_from_model(true);
     m_account_type_combobox->set_selected_index(is_admin ? 1 : 0);
     m_account_type_combobox->on_change = [this](auto&, auto) {
@@ -105,26 +110,14 @@ ErrorOr<void> UserDetailsWidget::change_password()
             GUI::MessageBox::show(window(), "Passwords do not match."sv, "Error"sv, GUI::MessageBox::Type::Error);
             return;
         }
-        auto password = Core::SecretString::take_ownership(new_password_textbox.text().to_byte_buffer());
-        // Re-read account fresh from disk to only modify the password field.
-        auto fresh_account_or_error = Core::Account::from_name(m_account->username());
-        if (fresh_account_or_error.is_error()) {
-            GUI::MessageBox::show(window(), "Failed to read account."sv, "Error"sv, GUI::MessageBox::Type::Error);
+        // 密码走 root 代理的 chpasswd：不进 argv，也不碰 /etc/shadow 格式。
+        auto password = new_password_textbox.text();
+        auto result = hostd_set_password(m_account->username(), password.view());
+        if (result.is_error()) {
+            auto message = ByteString::formatted("Failed to set password: {}", result.error());
+            GUI::MessageBox::show(window(), message.view(), "Error"sv, GUI::MessageBox::Type::Error);
             return;
         }
-        auto& fresh_account = fresh_account_or_error.value();
-        if (fresh_account.set_password(password).is_error()) {
-            GUI::MessageBox::show(window(), "Failed to set password."sv, "Error"sv, GUI::MessageBox::Type::Error);
-            return;
-        }
-        if (fresh_account.sync().is_error()) {
-            GUI::MessageBox::show(window(), "Failed to save changes."sv, "Error"sv, GUI::MessageBox::Type::Error);
-            return;
-        }
-        // Reload m_account so a subsequent Apply does not overwrite with stale password hash.
-        auto reloaded = Core::Account::from_name(m_account->username());
-        if (!reloaded.is_error())
-            m_account = reloaded.release_value();
 
         dialog->done(GUI::Dialog::ExecResult::OK);
     };
@@ -143,28 +136,20 @@ ErrorOr<void> UserDetailsWidget::apply_changes()
 {
     VERIFY(m_account.has_value());
 
-    // Preserve GECOS fields beyond the full name (Room, Work, Home, Other).
+    // 保留 GECOS 里逗号之后的 Room / Work / Home / Other 字段。
     auto existing_gecos = m_account->gecos();
-    auto first_comma = existing_gecos.find(',');
-    if (first_comma.has_value())
-        m_account->set_gecos(ByteString::formatted("{}{}", m_full_name_textbox->text(), existing_gecos.substring_view(first_comma.value())));
-    else
-        m_account->set_gecos(m_full_name_textbox->text());
-    m_account->set_shell(m_shell_textbox->text());
+    auto full_name = m_full_name_textbox->text();
+    auto shell = m_shell_textbox->text();
+    if (auto first_comma = existing_gecos.find(','); first_comma.has_value())
+        full_name = ByteString::formatted("{}{}", full_name, existing_gecos.substring_view(first_comma.value()));
 
-    // Update administrator (wheel group) membership.
-    auto maybe_wheel = TRY(Core::System::getgrnam(WHEEL_GROUP_NAME));
-    if (maybe_wheel.has_value()) {
-        gid_t wheel_gid = maybe_wheel->gr_gid;
-        bool is_admin_selected = m_account_type_combobox->selected_index() == 1;
-        bool already_admin = m_account->extra_gids().contains_slow(wheel_gid);
-        if (is_admin_selected && !already_admin)
-            m_account->add_extra_gid(wheel_gid);
-        else if (!is_admin_selected && already_admin)
-            m_account->remove_extra_gid(wheel_gid);
-    }
-
-    TRY(m_account->sync());
+    // 全名、登录 Shell、管理员资格统一交给 root 代理落盘。绝不能再调
+    // Core::Account::sync()：它会按 Serenity 格式重刷 /etc/passwd、
+    // /etc/group、/etc/shadow，足以破坏 Linux 系统登录。
+    TRY(hostd_modify_user(m_account->username(),
+        full_name.view(),
+        shell.view(),
+        m_account_type_combobox->selected_index() == 1));
 
     return {};
 }

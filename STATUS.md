@@ -36,6 +36,14 @@
 | xdg_popup.grab / 菜单点外部关闭 / 菜单定位 | ✅ 已完成（11-04 VM 验证，gedit 实机操作） | §1.3 |
 | 窗口装饰强制复古框（回退 CSD 尊重） | ✅ 已完成（11-04 VM 验证） | §1.3 |
 | 原生 Wayland 客户端输入 | ✅ 已完成（GTK4 打字实测；Firefox 原生 Wayland 11-04 已可正常重绘+输入） | §1.3 |
+| **核心稳定性（11-09 审计 + VM 实测）** | ✅ 修 18 处并在 VM 验证：裸 IPC 注入 5 例全部只断开客户端、A/B 对照证明旧版同输入 `fatal signal 4` 而新版 pid 不变；15 次 SIGKILL、6 窗口叠放、gedit 走桥均零崩溃 | `HANDOFF_STABILITY_2026-11-09.md`、`scripts/ipc_stability_probe.py` |
+| **输入法链路（11-09 修复 + VM 验证）** | ✅ 新版 `serenity-engine` 已部署；manager 统一注入 `SERENITY_IME_STATUS_DIR` 并推给 user/D-Bus 环境；托盘中英提示、设置界面启用状态、配置读写目录、`reload` 自动重启全部实测通过 | `HANDOFF_STABILITY_2026-11-09.md` §8 |
+| **librime 源码集成评估（11-09）** | 📋 暂不做全量 vendored；建议先做「私有化部署 + rpath」，消除编/跑版本漂移与系统包依赖 | `HANDOFF_STABILITY_2026-11-09.md` §9 |
+| **候选字体大小（11-09 补充）** | ✅ 输入法设置新增 8–48 磅 SpinBox（默认 14）；配置写在 `~/.config/serenity/ime-candidate-font-size`，候选面板每次刷新重读，原生/桥/预览共用 `set_content()` 一处生效；不加类成员以免 ABI 平移 | `HANDOFF_STABILITY_2026-11-09.md` §8 补充 |
+| **Linux 宿主访问代理 + 用户管理（11-09）** | ✅ 新增 root 守护 `serenity-hostd`（能力化协议 + peercred/输入校验），`UsersSettings` 全部写操作改走代理、去掉 root 门槛，并修好 GML `try_create()` 不调 `initialize()` 的隐藏 bug；VM 实测增删用户、`/etc/passwd\|group\|shadow` 格式完好。**晚间由 Python 改写为单文件 C++**（`Hostd/serenity-hostd.cpp` + `build.sh`），顺带修掉「空密码建号报 *参数个数不对*」（旧版 `strip()` 把请求行尾随空字段吃掉）并给设密码失败加账户回滚 | `HANDOFF_STABILITY_2026-11-09.md` §10 / §12 |
+| **主题引擎 / CSS 可行性（11-09）** | 📋 现状＝定长 `SystemTheme` POD + 3 个编译期窗口 painter；建议做「CSS 方言编译成 token」，不做运行时 CSS 渲染 | `THEME_ENGINE_CSS.md` |
+| **中文化补全（11-09 晚）** | ✅ 审计脚本补扫 GML（真实覆盖率 80%→62%），新增 243 条翻译：用户设置 100%（35/35）、显示/鼠标/键盘/时钟/日历/终端/浏览器/文件属性全覆盖，总覆盖 77%；`Account Type` 下拉值改由应用侧 `account_type_names()` 翻译（ComboBox 不走 `set_text` 通路）；VM 实测界面全中文 | `HANDOFF_STABILITY_2026-11-09.md` §13、`scripts/port/ui-strings.py` |
+| **Linux 应用文件选择器接原生（11-09 夜）** | ✅ 已实现：`serenity-portal` 直接实现 `org.freedesktop.portal.FileChooser`（version 3）+ `Request` + `host.portal.Registry`，fork `serenity-file-picker` 弹原生 `GUI::FilePicker`；桥补 xdg-foreign v1/v2（否则 GTK 静默回退），serenitid 设 `GTK_USE_PORTAL=1`。协议三种响应码、选项解析、**单播 Response**、serenitid 常驻 portal 均实测；GTK3/GTK4 端到端拿到 `file://` URI（§15.5） | `HANDOFF_STABILITY_2026-11-09.md` §15 |
 | 开始菜单 Linux Apps + 点击启动 | ✅ 已完成 | §1.3 |
 | 任务栏快速启动栏 | ✅ 已完成 | §1.2 |
 | 系统监视器 Lite | ✅ 已完成 | §1.2 |

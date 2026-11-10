@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/ByteString.h>
 #include <AK/Function.h>
 #include <AK/String.h>
 #include <AK/Vector.h>
@@ -15,6 +16,22 @@
 #include <LibGfx/Size.h>
 
 namespace GUI {
+
+// 候选字体大小（磅）。设置界面写、候选面板每次刷新时重读，所以改完设置
+// 下一次打字就生效，不需要重启应用。三个使用者（原生 LibGUI 候选窗、
+// Wayland 桥候选窗、输入法设置里的预览）都是 InputMethodPanelWidget，
+// 统一在 set_content() 里应用。
+constexpr int default_candidate_font_size = 14;
+constexpr int min_candidate_font_size = 8;
+constexpr int max_candidate_font_size = 48;
+
+ByteString candidate_font_size_config_path();
+int candidate_font_size();
+bool set_candidate_font_size(int point_size);
+
+// 仅供输入法设置界面的即时预览：进程级临时覆盖，传 -1 取消。
+// 桥和原生应用不会调用它，因此始终读配置文件。
+void set_candidate_font_size_preview_override(int point_size);
 
 // The little panel that shows the preedit string and the candidate list.
 // Drawn by us (the engine is configured for client-side UI), so it follows the

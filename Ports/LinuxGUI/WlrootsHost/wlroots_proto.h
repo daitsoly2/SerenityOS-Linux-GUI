@@ -27,6 +27,8 @@ extern "C" {
 #endif
 
 typedef struct wlroots_proto wlroots_proto;
+struct wl_display;
+struct wl_resource;
 
 struct wlroots_proto_callbacks {
     void* user;
@@ -101,6 +103,16 @@ wlroots_proto* wlroots_proto_create(char const* socket_name,
     struct wlroots_proto_callbacks const* callbacks);
 void wlroots_proto_destroy(wlroots_proto*);
 
+/* Expose the wl_display so companion protocol modules can register globals
+ * on the same event loop (serenity_menu_v1). Opaque to callers. */
+struct wl_display* wlroots_proto_display(wlroots_proto*);
+
+/* Reverse lookup used by serenity_menu_v1: a client sends the wl_resource of
+ * the anchor wl_surface, but the host window table is keyed by wlr_surface*.
+ * Returns the wlr_surface* (as void*) or NULL. Wayland object ids are
+ * per-client, so the client pid is matched as well. */
+void* wlroots_proto_surface_from_resource(wlroots_proto*, struct wl_resource* resource);
+
 int wlroots_proto_event_fd(wlroots_proto*);
 void wlroots_proto_dispatch(wlroots_proto*, int timeout_ms);
 void wlroots_proto_flush(wlroots_proto*);
@@ -112,6 +124,14 @@ char const* wlroots_proto_socket(wlroots_proto*);
  */
 void wlroots_proto_pointer_enter(wlroots_proto*, void* surface, double sx, double sy);
 void wlroots_proto_pointer_motion(wlroots_proto*, double sx, double sy, uint32_t time_msec);
+/* 先确保 seat 的 pointer focus 落在 `surface` 上（必要时补发 enter），再投 motion。
+ * 关键修复：Serenity 把鼠标移动事件按光标下的 widget 派发；光标从 toplevel 跨进
+ * 刚弹出的 popup 窗口时，popup widget 的 enter_event 还没有坐标（m_has_pointer_position
+ * 为 false），于是桥没发 wl_pointer.enter，seat 焦点一直停在 toplevel。此时桥转发的
+ * motion 被 wlr_seat 投给了 toplevel，GTK 的 popup 永远收不到 motion → 菜单项 PRELIGHT
+ * 永不触发。把「这个 motion 属于哪个 surface」显式传进来，首次见到对该 surface 的移动
+ * 时补发 enter，focus 即落到 popup 上。 */
+void wlroots_proto_pointer_motion_to(wlroots_proto*, void* surface, double sx, double sy, uint32_t time_msec);
 void wlroots_proto_pointer_button(wlroots_proto*, uint32_t button, bool pressed, uint32_t time_msec);
 void wlroots_proto_pointer_axis(wlroots_proto*, double vertical, double horizontal, uint32_t time_msec);
 void wlroots_proto_pointer_leave(wlroots_proto*);

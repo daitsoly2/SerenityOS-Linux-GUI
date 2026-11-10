@@ -1,0 +1,7 @@
+# Vendored upstream trees are reproducible from sync.sh + versions.env.
+vendor/
+build/
+*.o
+*.a
+*.so
+__pycache__/

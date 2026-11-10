@@ -1,0 +1,11 @@
+T1	PASS	桥进程	serenitid 托管, 1 实例
+T2	PASS	Wayland + X11 socket	两者均存在
+T3	PASS	Wayland 事件循环 roundtrip	ROUNDTRIP_OK globals=14
+T4	PASS	serenity_menu_v1 global / bind	BOUND name=14 version=1
+T5	PASS	菜单由 WindowServer/Menu.cpp 弹出	ws-menu: popup -> Menu.cpp at 300,200
+T6	PASS	激活回传 (Action -> 协议事件)	ACTIVATED id=1 / ws-menu: activated id=1 -> client
+T7	PASS	dismiss 回传与资源清理	DISMISSED DONE 
+T8	PASS	X11/Xwayland 应用	xterm 窗口 1 个 / XWM 配对 3 条
+T9	PASS	GTK3 gedit 启动	pid=5516
+T10	PASS	GTK4 gnome-text-editor 启动	pid=5117
+T11	PASS	桌面截图	deploy-test/desktop.png
